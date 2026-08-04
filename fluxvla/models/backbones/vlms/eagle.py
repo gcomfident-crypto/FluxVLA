@@ -27,8 +27,6 @@ from transformers.models.qwen3.modeling_qwen3 import (Qwen3Attention,
 from fluxvla.engines import VLM_BACKBONES, str_to_dtype
 from fluxvla.models.third_party_models.eagle2_hg_model.modeling_eagle2_5_vl import \
     Eagle2_5_VLForConditionalGeneration  # noqa: E501
-from fluxvla.models.third_party_models.eagle2_hg_model.modeling_eagle2_5_vl_inference import \
-    Eagle2_5_VLInferenceForConditionalGeneration  # noqa: E501
 from .hf_vlm import apply_attn_implementation_to_config
 
 
@@ -57,7 +55,8 @@ class EagleBackbone(nn.Module):
                  select_layer: int = 12,
                  dtype='float32',
                  tune_llm: Optional[bool] = None,
-                 tune_visual: Optional[bool] = None):
+                 tune_visual: Optional[bool] = None,
+                 attention_implementation: str = 'flash_attention_2'):
         super().__init__()
 
         config = AutoConfig.from_pretrained(vlm_path, trust_remote_code=True)
@@ -71,7 +70,7 @@ class EagleBackbone(nn.Module):
 
         # Ensure the attention implementation is set before model creation.
         # This must be done BEFORE model creation
-        apply_attn_implementation_to_config(config, 'flash_attention_2')
+        apply_attn_implementation_to_config(config, attention_implementation)
 
         # Use torch_dtype parameter to initialize directly with the target
         # dtype This avoids the expensive .to() conversion after initialization
@@ -263,6 +262,13 @@ class EagleInferenceBackbone(nn.Module):
                  select_layer: int = 12,
                  dtype='float32'):
         super().__init__()
+
+        # Keep the Triton/custom-CUDA inference implementation lazy.  The
+        # ordinary Eagle model and the TensorRT ONNX exporter do not use it,
+        # and importing it eagerly would make those paths depend on kernels
+        # that are unrelated to TensorRT deployment.
+        from fluxvla.models.third_party_models.eagle2_hg_model.modeling_eagle2_5_vl_inference import \
+            Eagle2_5_VLInferenceForConditionalGeneration  # noqa: E501
 
         config = AutoConfig.from_pretrained(vlm_path, trust_remote_code=True)
         config.max_input_seq_len = (

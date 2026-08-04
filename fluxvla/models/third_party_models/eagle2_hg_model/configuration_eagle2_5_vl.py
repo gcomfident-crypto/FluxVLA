@@ -16,7 +16,9 @@
 # Origin: Source
 # Upstream-URL: https://github.com/NVIDIA/Isaac-GR00T/blob/n1.5-release/gr00t/model/backbone/eagle2_hg_model/configuration_eagle2_5_vl.py
 # Upstream-Ref: n1.5-release
-# Notes: Attribution normalized; no functional change.
+# Notes: Modified by FluxVLA for TensorRT/ONNX deployment. RADIOConfig is
+# imported only when a RADIO vision configuration is selected, avoiding eager
+# loading of optional RADIO dependencies for SigLIP-based export and runtime.
 
 import copy
 
@@ -26,8 +28,6 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.utils import logging
-
-from .radio_model import RADIOConfig
 
 logger = logging.get_logger(__name__)
 
@@ -83,6 +83,7 @@ class Eagle2_5_VLConfig(PretrainedConfig):
         if vision_config['model_type'] == 'siglip_vision_model':
             self.vision_config = SiglipVisionConfig(**vision_config)
         elif vision_config['model_type'] == 'radio':
+            from .radio_model import RADIOConfig
             self.vision_config = RADIOConfig(**vision_config)
         else:
             raise ValueError('Unsupported model_type: {}'.format(

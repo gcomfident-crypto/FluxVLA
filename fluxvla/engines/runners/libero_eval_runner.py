@@ -422,40 +422,46 @@ class LiberoEvalRunner(BaseEvalRunner):
         if ckpt_path is not None:
             assert Path.exists(Path(ckpt_path)), \
                 f'Checkpoint path {ckpt_path} does not exist!'
-
-            if ckpt_path.endswith('.safetensors'):
-                state_dict = load_file(ckpt_path, device='cpu')
-            else:
-                # A sibling .safetensors is preferred when available because
-                # the .pt file also contains the optimizer/scheduler state
-                # which is unnecessary for inference and quickly exhausts
-                # CPU RAM when loaded on every rank (SIGKILL / exit -9).
-                sf_candidate = (
-                    ckpt_path[:-len('.pt')] +
-                    '.safetensors' if ckpt_path.endswith('.pt') else None)
-                if sf_candidate is not None and os.path.exists(sf_candidate):
-                    state_dict = load_file(sf_candidate, device='cpu')
+            self.call_model_hook('bind_eval_checkpoint', ckpt_path)
+            loading_mode = getattr(self.vla, 'checkpoint_loading_mode',
+                                   'state_dict')
+            if loading_mode not in ('state_dict', 'engine_only'):
+                raise ValueError(
+                    f'Unsupported checkpoint_loading_mode: {loading_mode}')
+            if loading_mode == 'state_dict':
+                if ckpt_path.endswith('.safetensors'):
+                    state_dict = load_file(ckpt_path, device='cpu')
                 else:
-                    # mmap=True avoids copying the whole checkpoint into RAM
-                    # on every rank.
-                    try:
-                        checkpoint = torch.load(
-                            ckpt_path, map_location='cpu', mmap=True)
-                    except TypeError:
-                        checkpoint = torch.load(ckpt_path, map_location='cpu')
-                    if isinstance(checkpoint, dict) and 'model' in checkpoint:
-                        state_dict = checkpoint['model']
-                        # Drop optimizer/scheduler state ASAP to reclaim RAM.
-                        checkpoint.pop('optimizer_state_dict', None)
-                        checkpoint.pop('scheduler_state_dict', None)
-                        checkpoint.pop('optimizer_state_index_to_name', None)
+                    # Prefer a sibling safetensors file. Loading optimizer
+                    # state from .pt can exhaust CPU memory on every rank.
+                    sf_candidate = (
+                        ckpt_path[:-len('.pt')] +
+                        '.safetensors' if ckpt_path.endswith('.pt') else None)
+                    if (sf_candidate is not None
+                            and os.path.exists(sf_candidate)):
+                        state_dict = load_file(sf_candidate, device='cpu')
                     else:
-                        state_dict = checkpoint
-                    del checkpoint
-                    gc.collect()
-            self.load_eval_state_dict(state_dict, allowed_missing_key_prefixes)
-            del state_dict
-            gc.collect()
+                        try:
+                            checkpoint = torch.load(
+                                ckpt_path, map_location='cpu', mmap=True)
+                        except TypeError:
+                            checkpoint = torch.load(
+                                ckpt_path, map_location='cpu')
+                        if (isinstance(checkpoint, dict)
+                                and 'model' in checkpoint):
+                            state_dict = checkpoint['model']
+                            checkpoint.pop('optimizer_state_dict', None)
+                            checkpoint.pop('scheduler_state_dict', None)
+                            checkpoint.pop('optimizer_state_index_to_name',
+                                           None)
+                        else:
+                            state_dict = checkpoint
+                        del checkpoint
+                        gc.collect()
+                self.load_eval_state_dict(state_dict,
+                                          allowed_missing_key_prefixes)
+                del state_dict
+                gc.collect()
         data_stat_path = (
             dataset_stats_path if dataset_stats_path is not None else
             self.default_stats_path(self.ckpt_path))
@@ -525,22 +531,35 @@ class LiberoEvalRunner(BaseEvalRunner):
                 device=self.device_id, dtype=self.mixed_precision_dtype)
         else:
             self.vla.cuda(self.device_id)
+        self.call_model_hook('prepare_inference_runtime', self.device_id)
 
     def cleanup(self) -> None:
         """Release per-suite evaluation resources before the next suite."""
-        self.vla = None
-        self.dataset = None
-        self.denormalize_action = None
+        close_error = None
+        try:
+            if self.vla is not None:
+                self.call_model_hook(
+                    'close_inference_runtime',
+                    reverse=True,
+                    continue_on_error=True)
+        except Exception as exc:  # noqa: BLE001
+            close_error = exc
+        finally:
+            self.vla = None
+            self.dataset = None
+            self.denormalize_action = None
 
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            ipc_collect = getattr(torch.cuda, 'ipc_collect', None)
-            if callable(ipc_collect):
-                try:
-                    ipc_collect()
-                except RuntimeError:
-                    pass
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                ipc_collect = getattr(torch.cuda, 'ipc_collect', None)
+                if callable(ipc_collect):
+                    try:
+                        ipc_collect()
+                    except RuntimeError:
+                        pass
+        if close_error is not None:
+            raise close_error
 
     def run(self):
         """Run the evaluation process."""

@@ -48,6 +48,7 @@ dist/
 build/
 out/
 *.egg-info/
+deployment_artifacts/
 
 # Ignore work directories
 work_dirs/

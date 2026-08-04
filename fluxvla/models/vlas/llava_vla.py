@@ -202,6 +202,14 @@ class LlavaVLA(OpenVLA):
                 assert 'last_hidden_state' in output, \
                     'Output must contain either hidden_states or last_hidden_state.'  # noqa: E501
                 last_hidden_state = output['last_hidden_state']
+        inference_controls = {}
+        if getattr(self.vla_head, 'supports_predict_action_controls', False):
+            control_names = getattr(self.vla_head,
+                                    'predict_action_control_names', ())
+            inference_controls = {
+                name: kwargs[name]
+                for name in control_names if name in kwargs
+            }
         pred_actions = self.vla_head.predict_action(
             input_features=last_hidden_state,
             states=states,
@@ -209,5 +217,6 @@ class LlavaVLA(OpenVLA):
             embodiment_ids=embodiment_ids,
             prev_actions=prev_actions,
             prefix_len=prefix_len,
-            rtc_config=rtc_config)
+            rtc_config=rtc_config,
+            **inference_controls)
         return pred_actions.float()
