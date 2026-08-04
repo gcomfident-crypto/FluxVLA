@@ -243,6 +243,13 @@ class LlavaVLA(BaseVLA):
             prev_actions=prev_actions,
             prefix_len=prefix_len,
             rtc_config=rtc_config)
+        if getattr(self.vla_head, 'supports_predict_action_controls', False):
+            control_names = getattr(self.vla_head,
+                                    'predict_action_control_names', ())
+            predict_kwargs.update({
+                name: kwargs[name]
+                for name in control_names if name in kwargs
+            })
         if isinstance(backbone_output, VLMBackboneOutput):
             image_mask = backbone_output.auxiliary_outputs.get('image_mask')
             if image_mask is not None:

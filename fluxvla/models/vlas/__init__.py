@@ -14,8 +14,11 @@
 
 from fluxvla.engines.utils.heterogeneous_runtime import \
     import_heterogeneous_runtime_symbols
+from .llava_tensorrt import LlavaTensorRT  # noqa: F401, F403
 from .llava_vla import LlavaVLA  # noqa: F401, F403
 from .open_vla import OpenVLA  # noqa: F401, F403
+from .pi05_flowmatching_tensorrt import \
+    PI05FlowMatchingTensorRTInference  # noqa: F401, F403
 
 import_heterogeneous_runtime_symbols(
     __name__,

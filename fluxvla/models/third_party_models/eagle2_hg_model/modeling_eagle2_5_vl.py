@@ -8,7 +8,9 @@
 # Origin: Source
 # Upstream-URL: https://github.com/NVIDIA/Isaac-GR00T/blob/n1.5-release/gr00t/model/backbone/eagle2_hg_model/modeling_eagle2_5_vl.py
 # Upstream-Ref: n1.5-release
-# Notes: Attribution normalized; no functional change.
+# Notes: Modified by FluxVLA for TensorRT/ONNX deployment. The SigLIP attention
+# implementation selected by the caller is preserved instead of being forced
+# to FlashAttention 2, and RADIOModel is imported only for RADIO backbones.
 
 import inspect
 from typing import List, Optional, Tuple, Union
@@ -30,7 +32,6 @@ from transformers.utils import add_start_docstrings
 
 from fluxvla.engines.utils.overwatch import initialize_overwatch
 from .configuration_eagle2_5_vl import Eagle2_5_VLConfig
-from .radio_model import RADIOModel
 
 overwatch = initialize_overwatch(__name__)
 
@@ -117,9 +118,9 @@ class Eagle2_5_VLForConditionalGeneration(Eagle2_5_VLPreTrainedModel,
             self.vision_model = vision_model
         else:
             if config.vision_config.model_type == 'siglip_vision_model':
-                config.vision_config._attn_implementation = 'flash_attention_2'
                 self.vision_model = SiglipVisionModel(config.vision_config)
             elif config.vision_config.model_type == 'radio':
+                from .radio_model import RADIOModel
                 self.vision_model = RADIOModel(config.vision_config)
             else:
                 raise NotImplementedError(

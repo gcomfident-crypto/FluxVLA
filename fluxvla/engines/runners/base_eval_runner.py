@@ -15,6 +15,7 @@
 
 import copy
 import os
+import weakref
 from pathlib import Path
 from typing import Any, Dict
 
@@ -87,6 +88,9 @@ class BaseEvalRunner:
         self, state_dict: Dict,
         allowed_missing_key_prefixes=()) -> None:  # noqa: E125
         """Load eval weights with optional missing-key prefixes."""
+        prepare = getattr(self.vla, 'prepare_eval_state_dict', None)
+        if callable(prepare):
+            state_dict = prepare(state_dict)
         missing, unexpected = self.vla.load_state_dict(
             state_dict, strict=False)
         unexpected = list(unexpected)
@@ -104,6 +108,46 @@ class BaseEvalRunner:
         ]
         assert not offending, ('Missing keys while loading eval checkpoint: '
                                f'{offending[:10]}')
+
+    def call_model_hook(self,
+                        hook_name: str,
+                        *args,
+                        reverse: bool = False,
+                        continue_on_error: bool = False):
+        """Call an optional deployment lifecycle hook on model modules.
+
+        TensorRT adapters use these hooks to bind an engine bundle to the
+        evaluation checkpoint, deserialize plans after CUDA placement, and
+        release execution contexts during runner cleanup.  Ordinary PyTorch
+        modules do not implement the hooks and are unaffected.
+        """
+        # Weak references are important for TensorRT preparation: adapter
+        # hooks delete the PyTorch modules covered by an engine before plan
+        # deserialization.  A normal list would keep those large modules alive
+        # until every hook finished and create an avoidable peak-memory spike.
+        modules = [weakref.ref(module) for module in self.vla.modules()]
+        if reverse:
+            modules.reverse()
+        called = []
+        errors = []
+        for module_ref in modules:
+            module = module_ref()
+            if module is None:
+                continue
+            hook = getattr(module, hook_name, None)
+            if callable(hook):
+                try:
+                    hook(*args)
+                    called.append(module)
+                except Exception as exc:  # noqa: BLE001
+                    if not continue_on_error:
+                        raise
+                    errors.append(exc)
+        if errors:
+            raise RuntimeError(
+                f'{len(errors)} model hook(s) failed during {hook_name}') \
+                from errors[0]
+        return called
 
     def set_common_eval_attrs(self, cfg: Dict, seed: int, ckpt_path: str,
                               model_family: str, mixed_precision_dtype: str,
