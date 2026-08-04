@@ -14,13 +14,16 @@
 
 import csv
 import gc
+import hashlib
 import json
 import math
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Dict
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import tqdm
@@ -36,6 +39,41 @@ from .base_eval_runner import BaseEvalRunner
 
 overwatch = initialize_overwatch(__name__)
 LIBERO_TASK_SHARDING_ALLOWED_ENV = 'FLUXVLA_ALLOW_LIBERO_TASK_SHARDING'
+
+_PROFILE_MODULE_FIELDS = [
+    'vision_ms', 'vision_calls', 'vision_mean_ms', 'prefix_ms', 'prefix_calls',
+    'prefix_mean_ms', 'denoise_ms', 'denoise_calls', 'denoise_mean_ms',
+    'denoise_step_ms', 'denoise_step_calls', 'denoise_step_mean_ms',
+    'backbone_total_ms', 'backbone_total_calls', 'backbone_total_mean_ms',
+    'vit_ms', 'vit_calls', 'vit_mean_ms', 'llm_ms', 'llm_calls', 'llm_mean_ms',
+    'backbone_processor_ms', 'backbone_processor_calls',
+    'backbone_processor_mean_ms', 'state_encoder_ms', 'state_encoder_calls',
+    'state_encoder_mean_ms', 'action_expert_ms', 'action_expert_calls',
+    'action_expert_mean_ms', 'action_encoder_ms', 'action_encoder_calls',
+    'action_encoder_mean_ms', 'dit_ms', 'dit_calls', 'dit_mean_ms',
+    'action_decoder_ms', 'action_decoder_calls', 'action_decoder_mean_ms'
+]
+
+_PROFILE_CALL_FIELDS = [
+    'schema_version', 'rank', 'model', 'backend', 'task_id', 'trial_id',
+    'call_index', 'trial_call_index', 'env_step', 'warmup', 'actions_returned',
+    'actions_executed', 'preprocess_ms', 'model_inference_ms',
+    'output_transfer_ms', 'action_denorm_ms', 'model_pipeline_total_ms',
+    'module_profile', *_PROFILE_MODULE_FIELDS
+]
+
+_PROFILE_TRIAL_FIELDS = [
+    'schema_version', 'rank', 'model', 'backend', 'task_id', 'trial_id',
+    'initial_state_index', 'initial_state_sha256', 'seed', 'inference_seed',
+    'status', 'error_type', 'error_message', 'success', 'env_steps',
+    'model_calls_total', 'model_calls_measured', 'actions_executed',
+    'episode_start_unix', 'episode_end_unix', 'episode_wall_s',
+    'preprocess_total_ms', 'preprocess_mean_ms', 'model_inference_total_ms',
+    'model_inference_mean_ms', 'output_transfer_total_ms',
+    'output_transfer_mean_ms', 'action_denorm_total_ms',
+    'action_denorm_mean_ms', 'model_pipeline_total_ms',
+    'model_pipeline_mean_ms', 'torch_peak_allocated_mib'
+]
 
 
 def _get_libero_benchmark():
@@ -401,6 +439,11 @@ class LiberoEvalRunner(BaseEvalRunner):
                  run_id_suffix: str = None,
                  result_output_dir: str = None,
                  result_gpu_id: int = None,
+                 enable_time_profile: bool = False,
+                 enable_module_profile: bool = False,
+                 time_profile_warmup_calls: int = 5,
+                 time_profile_backend: str = 'pytorch',
+                 time_profile_model: str = None,
                  mixed_precision_dtype: str = 'bf16',
                  enable_mixed_precision_training: bool = True):
         from fluxvla.engines import (build_dataset_from_cfg,
@@ -505,6 +548,27 @@ class LiberoEvalRunner(BaseEvalRunner):
         self.result_output_dir = result_output_dir
         self.result_gpu_id = (
             self.device_id if result_gpu_id is None else int(result_gpu_id))
+        self.enable_time_profile = bool(enable_time_profile)
+        self.enable_module_profile = bool(enable_module_profile)
+        if self.enable_module_profile and not self.enable_time_profile:
+            raise ValueError(
+                'enable_module_profile requires enable_time_profile')
+        self.time_profile_warmup_calls = int(time_profile_warmup_calls)
+        if self.time_profile_warmup_calls < 0:
+            raise ValueError('time_profile_warmup_calls must be non-negative')
+        self.time_profile_backend = str(time_profile_backend).lower()
+        if self.time_profile_backend not in ('pytorch', 'tensorrt'):
+            raise ValueError(
+                'time_profile_backend must be pytorch or tensorrt')
+        self.time_profile_model = str(time_profile_model or model_family)
+        self._profile_call_index = 0
+        self._profile_warmup_complete = False
+        self._profile_active_trial = None
+        self._profile_active_rows = None
+        self._profile_call_file = None
+        self._profile_trial_file = None
+        self._profile_call_writer = None
+        self._profile_trial_writer = None
 
         if os.path.isfile(data_stat_path):
             with open(data_stat_path, 'r') as f:
@@ -516,6 +580,221 @@ class LiberoEvalRunner(BaseEvalRunner):
                 'You can ignore this if you are loading the base VLA (i.e. not fine-tuned) checkpoint.'  # noqa: E501
                 'Otherwise, you may run into errors when trying to call `predict_action()` due to an absent `unnorm_key`.'  # noqa: E501
             )
+
+    def _profile_cuda_sync(self) -> None:
+        if self.enable_time_profile and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device_id)
+
+    def _profile_preprocess(self, obs):
+        if not self.enable_time_profile:
+            batch, replay_img = self.dataset(obs)
+            return batch, replay_img, 0.0
+        self._profile_cuda_sync()
+        started = time.perf_counter_ns()
+        batch, replay_img = self.dataset(obs)
+        self._profile_cuda_sync()
+        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000.0
+        return batch, replay_img, elapsed_ms
+
+    def _profile_model_call(self, predict_kwargs):
+        if self.enable_time_profile:
+            self._profile_cuda_sync()
+            started = time.perf_counter_ns()
+        with torch.autocast(
+                'cuda',
+                dtype=self.mixed_precision_dtype,
+                enabled=self.enable_mixed_precision_training):
+            with torch.no_grad():
+                actions = self.vla.predict_action(**predict_kwargs)
+        if not self.enable_time_profile:
+            return actions, 0.0, {}
+        self._profile_cuda_sync()
+        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000.0
+        resolver = getattr(self.vla, 'resolve_inference_profile', None)
+        modules = (
+            resolver()
+            if self.enable_module_profile and callable(resolver) else {})
+        return actions, elapsed_ms, modules
+
+    def _profile_output_transfer(self, actions):
+        started = time.perf_counter_ns() if self.enable_time_profile else None
+        if len(actions.shape) == 3:
+            result = actions[0, :self.eval_chunk_size, :].float().cpu().numpy()
+        else:
+            assert len(actions.shape) == 2, \
+                f'Unexpected action shape: {actions.shape}'
+            result = actions[0, None, :].float().cpu().numpy()
+        elapsed_ms = ((time.perf_counter_ns() - started) /
+                      1_000_000.0 if started is not None else 0.0)
+        return result, elapsed_ms
+
+    def _open_time_profile(self, rank: int) -> None:
+        if not self.enable_time_profile:
+            return
+        profile_dir = os.path.join(self.run_dir, 'time_profile')
+        os.makedirs(profile_dir, exist_ok=True)
+        call_path = os.path.join(profile_dir,
+                                 f'rank{rank}_inference_calls.csv')
+        trial_path = os.path.join(profile_dir, f'rank{rank}_trials.csv')
+        self._profile_call_file = open(
+            call_path, 'w', newline='', encoding='utf-8')
+        self._profile_trial_file = open(
+            trial_path, 'w', newline='', encoding='utf-8')
+        self._profile_call_writer = csv.DictWriter(
+            self._profile_call_file,
+            fieldnames=_PROFILE_CALL_FIELDS,
+            extrasaction='ignore')
+        self._profile_trial_writer = csv.DictWriter(
+            self._profile_trial_file,
+            fieldnames=_PROFILE_TRIAL_FIELDS,
+            extrasaction='ignore')
+        self._profile_call_writer.writeheader()
+        self._profile_trial_writer.writeheader()
+        self._profile_call_file.flush()
+        self._profile_trial_file.flush()
+
+    def _close_time_profile(self) -> None:
+        for stream_name in ('_profile_call_file', '_profile_trial_file'):
+            stream = getattr(self, stream_name, None)
+            if stream is not None:
+                stream.flush()
+                stream.close()
+                setattr(self, stream_name, None)
+
+    def _write_profile_call(self, row: Dict) -> None:
+        if self._profile_call_writer is None:
+            return
+        self._profile_call_writer.writerow(row)
+        self._profile_call_file.flush()
+
+    def _write_profile_trial(self, row: Dict) -> None:
+        if self._profile_trial_writer is None:
+            return
+        self._profile_trial_writer.writerow(row)
+        self._profile_trial_file.flush()
+
+    def _write_interrupted_profile_trial(self) -> None:
+        """Persist the in-flight trial before cleanup after an interruption."""
+        base = self._profile_active_trial
+        rows = self._profile_active_rows
+        if base is None or rows is None or self._profile_trial_writer is None:
+            return
+        exc_type, exc, _ = sys.exc_info()
+        now = time.time()
+        base = dict(base)
+        base.update({
+            'status':
+            ('interrupted' if exc_type is not None
+             and issubclass(exc_type,
+                            (KeyboardInterrupt, SystemExit)) else 'error'),
+            'error_type':
+            '' if exc_type is None else exc_type.__name__,
+            'error_message':
+            '' if exc is None else str(exc)[:2000],
+            'success':
+            0,
+            'episode_end_unix':
+            now,
+            'episode_wall_s':
+            max(0.0, now - base['episode_start_unix']),
+            'torch_peak_allocated_mib':
+            torch.cuda.max_memory_allocated(self.device_id) / (1024.0**2),
+        })
+        self._write_profile_trial(self._trial_profile_row(base, rows))
+        self._profile_active_trial = None
+        self._profile_active_rows = None
+
+    def _profile_warmup(self, predict_kwargs: Dict, rank: int, task_id: int,
+                        trial_id: int, env_step: int,
+                        trial_rows: list) -> None:
+        """Warm the model before, rather than inside, the formal trial data."""
+        if (not self.enable_time_profile or self._profile_warmup_complete
+                or self.time_profile_warmup_calls == 0):
+            self._profile_warmup_complete = True
+            return
+        for _ in range(self.time_profile_warmup_calls):
+            call_index = self._profile_call_index
+            self._profile_call_index += 1
+            actions, model_ms, module_metrics = self._profile_model_call(
+                predict_kwargs)
+            if len(actions.shape) == 3:
+                actions_returned = min(
+                    int(actions.shape[1]), int(self.eval_chunk_size))
+            else:
+                actions_returned = 1
+            row = {
+                'schema_version': 1,
+                'rank': rank,
+                'model': self.time_profile_model,
+                'backend': self.time_profile_backend,
+                'task_id': task_id,
+                'trial_id': trial_id,
+                'call_index': call_index,
+                'trial_call_index': len(trial_rows),
+                'env_step': env_step,
+                'warmup': 1,
+                'actions_returned': actions_returned,
+                'actions_executed': 0,
+                'preprocess_ms': 0.0,
+                'model_inference_ms': model_ms,
+                'output_transfer_ms': 0.0,
+                'action_denorm_ms': 0.0,
+                'model_pipeline_total_ms': model_ms,
+                'module_profile': int(self.enable_module_profile),
+            }
+            row.update(module_metrics)
+            self._write_profile_call(row)
+            trial_rows.append(row)
+            del actions
+        self._profile_warmup_complete = True
+
+    @staticmethod
+    def _merge_rank_profile_csvs(run_dir: str, world_size: int) -> None:
+        profile_dir = os.path.join(run_dir, 'time_profile')
+        for suffix, fields in (('inference_calls', _PROFILE_CALL_FIELDS),
+                               ('trials', _PROFILE_TRIAL_FIELDS)):
+            output = os.path.join(profile_dir, f'{suffix}.csv')
+            with open(output, 'w', newline='', encoding='utf-8') as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                for rank in range(world_size):
+                    source = os.path.join(profile_dir,
+                                          f'rank{rank}_{suffix}.csv')
+                    if not os.path.isfile(source):
+                        raise FileNotFoundError(source)
+                    with open(source, newline='', encoding='utf-8') as part:
+                        for row in csv.DictReader(part):
+                            writer.writerow(row)
+
+    @staticmethod
+    def _trial_profile_row(base: Dict, call_rows: list) -> Dict:
+        measured = [row for row in call_rows if not row['warmup']]
+        result = dict(base)
+        result['model_calls_total'] = len(call_rows)
+        result['model_calls_measured'] = len(measured)
+        result['actions_executed'] = sum(
+            int(row['actions_executed']) for row in call_rows)
+        for name in ('preprocess', 'model_inference', 'output_transfer',
+                     'action_denorm', 'model_pipeline'):
+            source = f'{name}_ms' if name != 'model_pipeline' \
+                else 'model_pipeline_total_ms'
+            values = [float(row[source]) for row in measured]
+            result[f'{name}_total_ms'] = sum(values)
+            result[f'{name}_mean_ms'] = (
+                sum(values) / len(values) if values else '')
+        return result
+
+    @staticmethod
+    def _initial_state_sha256(initial_state) -> str:
+        """Return a stable identity for the exact LIBERO initial state."""
+        value = np.ascontiguousarray(np.asarray(initial_state))
+        digest = hashlib.sha256()
+        digest.update(str(value.dtype).encode('utf-8'))
+        digest.update(b'\0')
+        digest.update(json.dumps(list(value.shape)).encode('ascii'))
+        digest.update(b'\0')
+        digest.update(value.tobytes(order='C'))
+        return digest.hexdigest()
 
     def run_setup(self):
         """Set up the evaluation environment and model."""
@@ -531,6 +810,10 @@ class LiberoEvalRunner(BaseEvalRunner):
                 device=self.device_id, dtype=self.mixed_precision_dtype)
         else:
             self.vla.cuda(self.device_id)
+        configure_profile = getattr(self.vla, 'configure_inference_profile',
+                                    None)
+        if callable(configure_profile):
+            configure_profile(self.enable_module_profile)
         self.call_model_hook('prepare_inference_runtime', self.device_id)
 
     def cleanup(self) -> None:
@@ -615,6 +898,11 @@ class LiberoEvalRunner(BaseEvalRunner):
         self.run_dir = self._build_run_dir(
             self.ckpt_path, run_id, output_dir=self.result_output_dir)
         os.makedirs(self.run_dir, exist_ok=True)
+        self._profile_call_index = 0
+        self._profile_warmup_complete = False
+        self._profile_active_trial = None
+        self._profile_active_rows = None
+        self._open_time_profile(rank)
         progress_dir = os.path.join(self.run_dir, 'rank_progress')
         total_eval_episodes = len(
             self._build_global_episodes(num_tasks, self.num_trials_per_task,
@@ -701,13 +989,55 @@ class LiberoEvalRunner(BaseEvalRunner):
 
                 # Setup
                 t = 0
+                env_steps_executed = 0
                 replay_images = []
                 next_batch = None
+                next_batch_preprocess_ms = 0.0
+                trial_profile_rows = []
+                if self.enable_time_profile:
+                    self._profile_cuda_sync()
+                    torch.cuda.reset_peak_memory_stats(self.device_id)
 
                 overwatch.info(f'Starting episode {trial_id+1}...')
 
                 log_file.write(f'Starting episode {trial_id+1}...\n')
                 episode_start = time.time()
+                if self.enable_time_profile:
+                    self._profile_active_trial = {
+                        'schema_version':
+                        1,
+                        'rank':
+                        rank,
+                        'model':
+                        self.time_profile_model,
+                        'backend':
+                        self.time_profile_backend,
+                        'task_id':
+                        task_id,
+                        'trial_id':
+                        trial_id,
+                        'initial_state_index':
+                        trial_id,
+                        'initial_state_sha256':
+                        self._initial_state_sha256(initial_states[trial_id]),
+                        'seed':
+                        self.seed,
+                        'inference_seed': ('' if self.inference_seed is None
+                                           else self.inference_seed),
+                        'status':
+                        'running',
+                        'error_type':
+                        '',
+                        'error_message':
+                        '',
+                        'success':
+                        0,
+                        'env_steps':
+                        0,
+                        'episode_start_unix':
+                        episode_start,
+                    }
+                    self._profile_active_rows = trial_profile_rows
                 task_start_times[task_id] = min(task_start_times[task_id],
                                                 episode_start)
                 done = False
@@ -719,12 +1049,17 @@ class LiberoEvalRunner(BaseEvalRunner):
                     if t < self.num_steps_wait:
                         obs, reward, done, info = env.step(
                             get_libero_dummy_action())
+                        env_steps_executed += 1
+                        if self._profile_active_trial is not None:
+                            self._profile_active_trial[
+                                'env_steps'] = env_steps_executed
                         t += 1
                         continue
                     if next_batch is None:
                         obs['task_description'] = task_description
                         obs['is_new_episode'] = is_new_episode
-                        batch, replay_img = self.dataset(obs)
+                        batch, replay_img, preprocess_ms = \
+                            self._profile_preprocess(obs)
                         if (self._should_collect_replay_images()
                                 and len(replay_images) == 0):
                             replay_images.append(
@@ -732,6 +1067,8 @@ class LiberoEvalRunner(BaseEvalRunner):
                     else:
                         batch = next_batch
                         next_batch = None
+                        preprocess_ms = next_batch_preprocess_ms
+                        next_batch_preprocess_ms = 0.0
                     is_new_episode = False
                     batch['unnorm_key'] = unnorm_key
                     predict_kwargs = dict(batch)
@@ -740,28 +1077,40 @@ class LiberoEvalRunner(BaseEvalRunner):
                             self.num_inference_steps
                     if self.inference_seed is not None:
                         predict_kwargs['seed'] = self.inference_seed
-                    with torch.autocast(
-                            'cuda',
-                            dtype=self.mixed_precision_dtype,
-                            enabled=self.enable_mixed_precision_training):
-                        with torch.no_grad():
-                            actions = self.vla.predict_action(**predict_kwargs)
-                    if len(actions.shape) == 3:
-                        actions = actions[
-                            0, :self.eval_chunk_size, :].float().cpu().numpy()
-                    else:
-                        assert len(actions.shape) == 2, \
-                            f'Unexpected action shape: {actions.shape}'
-                        actions = actions[0, None, :].float().cpu().numpy()
+                    self._profile_warmup(predict_kwargs, rank, task_id,
+                                         trial_id, t, trial_profile_rows)
+                    call_index = self._profile_call_index
+                    self._profile_call_index += 1
+                    trial_call_index = len(trial_profile_rows)
+                    inference_env_step = t
+                    actions, model_inference_ms, module_metrics = \
+                        self._profile_model_call(predict_kwargs)
+                    actions, output_transfer_ms = \
+                        self._profile_output_transfer(actions)
+                    actions_returned = len(actions)
+                    actions_executed = 0
+                    action_denorm_ms = 0.0
                     for action in actions:
                         inputs = dict(
                             action=action,
                             task_suite_name=self.task_suite_name,
                             norm_stats_key=self.norm_stats_key,
                         )
+                        denorm_started = (
+                            time.perf_counter_ns()
+                            if self.enable_time_profile else None)
                         action_denormed = self.denormalize_action(inputs)
+                        action_denormed_list = action_denormed.tolist()
+                        if denorm_started is not None:
+                            action_denorm_ms += (time.perf_counter_ns() -
+                                                 denorm_started) / 1_000_000.0
+                        actions_executed += 1
                         obs, reward, done, info = env.step(
-                            action_denormed.tolist())
+                            action_denormed_list)
+                        env_steps_executed += 1
+                        if self._profile_active_trial is not None:
+                            self._profile_active_trial[
+                                'env_steps'] = env_steps_executed
                         if done:
                             total_successes += 1
                             rank_success_count += 1
@@ -773,17 +1122,46 @@ class LiberoEvalRunner(BaseEvalRunner):
                         if self.preprocess_every_step:
                             obs['task_description'] = task_description
                             obs['is_new_episode'] = False
-                            batch, replay_img = self.dataset(obs)
+                            batch, replay_img, next_preprocess_ms = \
+                                self._profile_preprocess(obs)
                             if self._should_collect_replay_images():
                                 replay_images.append(
                                     self._get_replay_image(obs, replay_img))
                             next_batch = batch
+                            next_batch_preprocess_ms += next_preprocess_ms
                         else:
                             if self._should_collect_replay_images():
                                 replay_images.append(
                                     self._get_replay_image(obs))
                             next_batch = None
                         t += 1
+                    if self.enable_time_profile:
+                        pipeline_ms = (
+                            preprocess_ms + model_inference_ms +
+                            output_transfer_ms + action_denorm_ms)
+                        call_row = {
+                            'schema_version': 1,
+                            'rank': rank,
+                            'model': self.time_profile_model,
+                            'backend': self.time_profile_backend,
+                            'task_id': task_id,
+                            'trial_id': trial_id,
+                            'call_index': call_index,
+                            'trial_call_index': trial_call_index,
+                            'env_step': inference_env_step,
+                            'warmup': 0,
+                            'actions_returned': actions_returned,
+                            'actions_executed': actions_executed,
+                            'preprocess_ms': preprocess_ms,
+                            'model_inference_ms': model_inference_ms,
+                            'output_transfer_ms': output_transfer_ms,
+                            'action_denorm_ms': action_denorm_ms,
+                            'model_pipeline_total_ms': pipeline_ms,
+                            'module_profile': int(self.enable_module_profile),
+                        }
+                        call_row.update(module_metrics)
+                        self._write_profile_call(call_row)
+                        trial_profile_rows.append(call_row)
                     if done:
                         break
                 total_episodes += 1
@@ -793,6 +1171,55 @@ class LiberoEvalRunner(BaseEvalRunner):
                 task_episodes[task_id] += 1.0
                 task_durations[task_id] += episode_duration
                 trial_success_grid[task_id, trial_id] = float(bool(done))
+                if self.enable_time_profile:
+                    episode_end = time.time()
+                    trial_row = self._trial_profile_row(
+                        {
+                            'schema_version':
+                            1,
+                            'rank':
+                            rank,
+                            'model':
+                            self.time_profile_model,
+                            'backend':
+                            self.time_profile_backend,
+                            'task_id':
+                            task_id,
+                            'trial_id':
+                            trial_id,
+                            'initial_state_index':
+                            trial_id,
+                            'initial_state_sha256':
+                            self._initial_state_sha256(
+                                initial_states[trial_id]),
+                            'seed':
+                            self.seed,
+                            'inference_seed':
+                            ('' if self.inference_seed is None else
+                             self.inference_seed),
+                            'status':
+                            'completed',
+                            'error_type':
+                            '',
+                            'error_message':
+                            '',
+                            'success':
+                            int(bool(done)),
+                            'env_steps':
+                            env_steps_executed,
+                            'episode_start_unix':
+                            episode_start,
+                            'episode_end_unix':
+                            episode_end,
+                            'episode_wall_s':
+                            episode_duration,
+                            'torch_peak_allocated_mib':
+                            torch.cuda.max_memory_allocated(self.device_id) /
+                            (1024.0**2),
+                        }, trial_profile_rows)
+                    self._write_profile_trial(trial_row)
+                    self._profile_active_trial = None
+                    self._profile_active_rows = None
                 if self._should_save_rollout_video(done):
                     video_root = (
                         self.result_output_dir if self.result_output_dir
@@ -855,10 +1282,12 @@ class LiberoEvalRunner(BaseEvalRunner):
                 log_file.write(success_log)
                 log_file.flush()
         finally:
+            self._write_interrupted_profile_trial()
             if env is not None:
                 env.close()
             if pbar is not None:
                 pbar.close()
+            self._close_time_profile()
 
         global_episodes = total_episodes.clone()
         global_successes = total_successes.clone()
@@ -913,6 +1342,9 @@ class LiberoEvalRunner(BaseEvalRunner):
                                                  trial_success_grid.cpu(),
                                                  task_start_times.cpu())
         log_file.close()
+        dist.barrier()
+        if rank == 0 and self.enable_time_profile:
+            self._merge_rank_profile_csvs(self.run_dir, world_size)
         dist.barrier()
         return
 

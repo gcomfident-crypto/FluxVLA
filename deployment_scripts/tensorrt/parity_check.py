@@ -464,16 +464,21 @@ def _metrics(reference: torch.Tensor, candidate: torch.Tensor) -> dict:
 
 
 def _evaluate(outputs: Mapping[str, torch.Tensor],
-              thresholds: Mapping[str, float]) -> tuple[dict, bool]:
+              thresholds: Mapping[str, float],
+              report_only: bool = False) -> tuple[dict, bool]:
     comparisons = {}
     passed = True
     for left, right in (('pytorch', 'wrapper'), ('pytorch', 'tensorrt'),
                         ('wrapper', 'tensorrt')):
         metrics = _metrics(outputs[left], outputs[right])
-        pair_passed = (
-            metrics['finite'] and metrics['max_abs'] <= thresholds['max_abs']
-            and metrics['rmse'] <= thresholds['rmse']
-            and metrics['cosine'] >= thresholds['min_cosine'])
+        if report_only:
+            pair_passed = metrics['finite']
+        else:
+            pair_passed = (
+                metrics['finite']
+                and metrics['max_abs'] <= thresholds['max_abs']
+                and metrics['rmse'] <= thresholds['rmse']
+                and metrics['cosine'] >= thresholds['min_cosine'])
         metrics['passed'] = pair_passed
         comparisons[f'{left}_vs_{right}'] = metrics
         passed = passed and pair_passed
@@ -493,6 +498,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-abs', type=float)
     parser.add_argument('--rmse', type=float)
     parser.add_argument('--min-cosine', type=float)
+    parser.add_argument(
+        '--report-only',
+        action='store_true',
+        help=('Record metrics without applying acceptance thresholds; '
+              'non-finite outputs still fail.'))
+    parser.add_argument(
+        '--output-json',
+        type=Path,
+        help='Also write the complete parity result to this JSON path.')
     return parser.parse_args()
 
 
@@ -543,18 +557,38 @@ def main() -> None:
                                                   args.engine_dir, inputs_cpu,
                                                   device)
 
-    comparisons, passed = _evaluate(outputs, thresholds)
+    comparisons, passed = _evaluate(
+        outputs, thresholds, report_only=args.report_only)
     result = {
         'model': args.model,
-        'checkpoint': args.checkpoint.name,
+        'checkpoint': str(args.checkpoint.resolve()),
+        'engine_dir': str(args.engine_dir.resolve()),
+        'pytorch_config': str(args.config.resolve()),
+        'tensorrt_config': str(args.tensorrt_config.resolve()),
         'device': str(device),
         'seed': args.seed,
-        'shape': list(outputs['pytorch'].shape),
+        'outputs': {
+            name: {
+                'shape': list(value.shape),
+                'dtype': str(value.dtype),
+                'finite': bool(torch.isfinite(value).all().item()),
+            }
+            for name, value in outputs.items()
+        },
         'thresholds': thresholds,
         'comparisons': comparisons,
         'passed': passed,
     }
-    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+    if args.report_only:
+        result['report_only'] = True
+        result['thresholds'] = None
+    rendered = json.dumps(
+        result, indent=2, sort_keys=True, allow_nan=False) + '\n'
+    print(rendered, end='')
+    if args.output_json is not None:
+        output_json = args.output_json.expanduser()
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_json.write_text(rendered, encoding='utf-8')
     if not passed:
         raise SystemExit(1)
 

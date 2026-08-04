@@ -25,6 +25,10 @@ from fluxvla.deployment.tensorrt.groot_n15 import (
 from fluxvla.deployment.tensorrt.groot_n15.runtime import \
     _validate_embodiment_metadata
 from fluxvla.engines import HEADS
+from fluxvla.engines.utils.inference_profile import (begin_module_profile,
+                                                     configure_module_profile,
+                                                     module_stage,
+                                                     resolve_module_profile)
 from .flow_matching_head import FlowMatchingHead
 
 
@@ -209,6 +213,7 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
         args: tuple,
         kwargs: dict,
     ) -> torch.Tensor:
+        begin_module_profile(self)
         if (prev_actions is not None or prefix_len != 0
                 or rtc_config is not None):
             raise ValueError('GR00T-N1.5 TensorRT does not support RTC')
@@ -243,10 +248,12 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
             features = input_features.to(torch.float16).contiguous()
             embodiment = embodiment_ids.to(torch.int64).contiguous()
             state = states.to(torch.float16).unsqueeze(1).contiguous()
-            features = self.trt_runtime.process_backbone(
-                features, selected_stream)
-            state_features = self.trt_runtime.encode_state(
-                state, embodiment, selected_stream)
+            with module_stage(self, 'backbone_processor', selected_stream):
+                features = self.trt_runtime.process_backbone(
+                    features, selected_stream)
+            with module_stage(self, 'state_encoder', selected_stream):
+                state_features = self.trt_runtime.encode_state(
+                    state, embodiment, selected_stream)
 
             if noise is None:
                 generator = None
@@ -275,22 +282,27 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
             future = self.future_tokens.weight.unsqueeze(0).to(torch.float16)
             dt = 1.0 / c.denoise_steps
 
-            for step in range(c.denoise_steps):
-                discretized = int((step / float(c.denoise_steps)) *
-                                  self.num_timestep_buckets)
-                timestep.fill_(discretized)
-                action_features = self.trt_runtime.encode_action(
-                    actions.contiguous(), timestep, embodiment,
-                    selected_stream)
-                action_features = action_features + position
-                sa_embs = torch.cat((state_features, future, action_features),
-                                    dim=1)
-                model_output = self.trt_runtime.run_dit(
-                    sa_embs.contiguous(), features, timestep, selected_stream)
-                prediction = self.trt_runtime.decode_action(
-                    model_output, embodiment, selected_stream)
-                velocity = prediction[:, -c.action_horizon:]
-                actions = actions + dt * velocity
+            with module_stage(self, 'action_expert', selected_stream):
+                for step in range(c.denoise_steps):
+                    discretized = int((step / float(c.denoise_steps)) *
+                                      self.num_timestep_buckets)
+                    timestep.fill_(discretized)
+                    with module_stage(self, 'action_encoder', selected_stream):
+                        action_features = self.trt_runtime.encode_action(
+                            actions.contiguous(), timestep, embodiment,
+                            selected_stream)
+                    action_features = action_features + position
+                    sa_embs = torch.cat(
+                        (state_features, future, action_features), dim=1)
+                    with module_stage(self, 'dit', selected_stream):
+                        model_output = self.trt_runtime.run_dit(
+                            sa_embs.contiguous(), features, timestep,
+                            selected_stream)
+                    with module_stage(self, 'action_decoder', selected_stream):
+                        prediction = self.trt_runtime.decode_action(
+                            model_output, embodiment, selected_stream)
+                    velocity = prediction[:, -c.action_horizon:]
+                    actions = actions + dt * velocity
 
             result = actions.clone()
             if self.ori_action_dim is not None:
@@ -322,6 +334,12 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
 
     def close_inference_runtime(self) -> None:
         self.trt_runtime.close()
+
+    def configure_inference_profile(self, enabled: bool) -> None:
+        configure_module_profile(self, enabled)
+
+    def resolve_inference_profile(self):
+        return resolve_module_profile(self)
 
     def __del__(self):
         runtime = getattr(self, 'trt_runtime', None)

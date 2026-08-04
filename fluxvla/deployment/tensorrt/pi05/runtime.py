@@ -28,6 +28,10 @@ from typing import Callable, Mapping, Optional
 
 import torch
 
+from fluxvla.engines.utils.inference_profile import (begin_module_profile,
+                                                     configure_module_profile,
+                                                     module_stage,
+                                                     resolve_module_profile)
 from ..runtime import TensorRTRuntime, TensorSpec
 from .contract import PI05ExportContract, pi05_cache_names
 
@@ -329,6 +333,7 @@ class PI05TensorRTInference:
         stream: Optional[torch.cuda.Stream] = None,
     ) -> torch.Tensor:
         """Execute V once, P once, and D ten times."""
+        begin_module_profile(self)
         device = self._validate_inputs(images, lang_tokens, states, img_masks,
                                        lang_masks, noise)
         with self._lock:
@@ -369,38 +374,51 @@ class PI05TensorRTInference:
                 else:
                     self._x_buffers[0].copy_(noise)
 
-                vision = self._runtimes['vision'].enqueue(
-                    {'images': images_v}, stream=selected_stream)
+                with module_stage(self, 'vision', selected_stream):
+                    vision = self._runtimes['vision'].enqueue(
+                        {'images': images_v}, stream=selected_stream)
                 prefix_inputs = {
                     'image_prefix': vision['image_prefix'],
                     'lang_tokens': tokens,
                     'lang_mask': mask,
                 }
-                caches = self._runtimes['prefix'].enqueue(
-                    prefix_inputs, stream=selected_stream)
+                with module_stage(self, 'prefix', selected_stream):
+                    caches = self._runtimes['prefix'].enqueue(
+                        prefix_inputs, stream=selected_stream)
 
                 current = 0
-                for timestep in self._timesteps:
-                    next_buffer = 1 - current
-                    self._timestep.fill_(timestep)
-                    denoise_inputs = {
-                        'x_t': self._x_buffers[current],
-                        'timestep': self._timestep,
-                        'lang_mask': mask,
-                    }
-                    denoise_inputs.update(
-                        {name: caches[name]
-                         for name in self._cache_names})
-                    self._runtimes['denoise'].enqueue(
-                        denoise_inputs,
-                        outputs={'x_next': self._x_buffers[next_buffer]},
-                        stream=selected_stream)
-                    current = next_buffer
+                with module_stage(self, 'denoise', selected_stream):
+                    for timestep in self._timesteps:
+                        next_buffer = 1 - current
+                        self._timestep.fill_(timestep)
+                        denoise_inputs = {
+                            'x_t': self._x_buffers[current],
+                            'timestep': self._timestep,
+                            'lang_mask': mask,
+                        }
+                        denoise_inputs.update(
+                            {name: caches[name]
+                             for name in self._cache_names})
+                        with module_stage(self, 'denoise_step',
+                                          selected_stream):
+                            self._runtimes['denoise'].enqueue(
+                                denoise_inputs,
+                                outputs={
+                                    'x_next': self._x_buffers[next_buffer]
+                                },
+                                stream=selected_stream)
+                        current = next_buffer
                 result = self._x_buffers[current].clone()
             if int(caller_stream.cuda_stream) != handle:
                 caller_stream.wait_stream(selected_stream)
                 result.record_stream(caller_stream)
             return result
+
+    def configure_inference_profile(self, enabled: bool) -> None:
+        configure_module_profile(self, enabled)
+
+    def resolve_inference_profile(self):
+        return resolve_module_profile(self)
 
     def close(self) -> None:
         if self._closed:

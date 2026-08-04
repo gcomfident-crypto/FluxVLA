@@ -29,6 +29,38 @@ import torch
 from .export_onnx import _load_checkpoint_state, _resolve_checkpoint
 
 
+def _predict_once(predict, args, device: torch.device) -> torch.Tensor:
+    """Run warm-ups and one prediction, optionally inside an nsys range."""
+    with torch.inference_mode():
+        for _ in range(args.warmup_calls):
+            predict()
+        if args.warmup_calls:
+            torch.cuda.synchronize(device)
+
+        if not args.cuda_profiler_range:
+            return predict()
+
+        # Nsight Systems can use the CUDA Profiler API as an exact capture
+        # boundary.  Keep model/engine loading and warm-up work outside it so
+        # the resulting report contains one public predict_action call.
+        torch.cuda.synchronize(device)
+        cudart = torch.cuda.cudart()
+        start_status = cudart.cudaProfilerStart()
+        if start_status != 0:
+            raise RuntimeError(
+                f'cudaProfilerStart failed with CUDA status {start_status}')
+        stop_status = 0
+        try:
+            output = predict()
+            torch.cuda.synchronize(device)
+        finally:
+            stop_status = cudart.cudaProfilerStop()
+        if stop_status != 0:
+            raise RuntimeError(
+                f'cudaProfilerStop failed with CUDA status {stop_status}')
+        return output
+
+
 def _validate_output(output: torch.Tensor, shape: tuple[int, ...]) -> None:
     if tuple(output.shape) != shape:
         raise RuntimeError(f'Unexpected action shape: {tuple(output.shape)} '
@@ -89,12 +121,15 @@ def _pi05(args, device: torch.device) -> torch.Tensor:
                 dtype=torch.bool,
                 device=device),
         }
-        with torch.inference_mode():
-            output = model.predict_action(
+
+        def predict() -> torch.Tensor:
+            return model.predict_action(
                 **batch,
                 seed=args.seed,
                 num_inference_steps=contract.denoise_steps,
                 unnorm_key='tensorrt_smoke')
+
+        output = _predict_once(predict, args, device)
         _validate_output(
             output,
             (contract.batch, contract.action_horizon, contract.action_dim))
@@ -176,11 +211,14 @@ def _groot(args, device: torch.device) -> torch.Tensor:
                        dtype=torch.int64,
                        device=device),
         }
-        with torch.inference_mode():
-            output = model.predict_action(
+
+        def predict() -> torch.Tensor:
+            return model.predict_action(
                 **batch,
                 seed=args.seed,
                 num_inference_steps=contract.denoise_steps)
+
+        output = _predict_once(predict, args, device)
         action_dim = (
             model.vla_head.ori_action_dim if model.vla_head.ori_action_dim
             is not None else contract.action_dim)
@@ -201,6 +239,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--embodiment-id', type=int, default=2)
+    parser.add_argument(
+        '--warmup-calls',
+        type=int,
+        default=0,
+        help='public predict_action calls completed before the checked call')
+    parser.add_argument(
+        '--cuda-profiler-range',
+        action='store_true',
+        help=('surround only the checked predict_action call with '
+              'cudaProfilerStart/Stop for Nsight Systems capture'))
     return parser.parse_args()
 
 
@@ -208,6 +256,8 @@ def main() -> None:
     args = parse_args()
     if args.seed < 0:
         raise ValueError('--seed must be non-negative')
+    if args.warmup_calls < 0:
+        raise ValueError('--warmup-calls must be non-negative')
     device = torch.device(args.device)
     if device.type != 'cuda':
         raise ValueError('TensorRT smoke inference requires a CUDA device')

@@ -33,6 +33,10 @@ if ! command -v "${TRTEXEC}" >/dev/null 2>&1; then
     echo "trtexec was not found. Set TRTEXEC=/absolute/path/to/trtexec."
     exit 1
 fi
+if [[ ! -x /usr/bin/time ]]; then
+    echo "/usr/bin/time is required to record engine build wall time."
+    exit 1
+fi
 
 MANIFEST="${ONNX_DIR}/export_manifest.json"
 if [[ ! -f "${MANIFEST}" ]]; then
@@ -131,17 +135,25 @@ build_engine() {
         exit 1
     fi
     echo "Building ${name}"
-    "${TRTEXEC}" \
-        --onnx="${onnx_path}" \
-        --saveEngine="${ENGINE_DIR}/${name}.engine" \
-        --stronglyTyped \
-        --noCudaGraph \
-        --skipInference \
-        --verbose \
-        --profilingVerbosity=detailed \
-        --timingCacheFile="${TIMING_CACHE}" \
-        "$@" \
+    local command=(
+        "${TRTEXEC}"
+        --onnx="${onnx_path}"
+        --saveEngine="${ENGINE_DIR}/${name}.engine"
+        --stronglyTyped
+        --noCudaGraph
+        --skipInference
+        --verbose
+        --profilingVerbosity=detailed
+        --timingCacheFile="${TIMING_CACHE}"
+        "$@"
+    )
+    printf '%q ' "${command[@]}" > "${ENGINE_DIR}/logs/${name}.command.txt"
+    printf '\n' >> "${ENGINE_DIR}/logs/${name}.command.txt"
+    /usr/bin/time -f '%e' -o "${ENGINE_DIR}/logs/${name}.build_time_seconds" \
+        "${command[@]}" \
         >"${ENGINE_DIR}/logs/${name}.log" 2>&1
+    date -u +%Y-%m-%dT%H:%M:%SZ \
+        > "${ENGINE_DIR}/logs/${name}.built_at_utc"
 }
 
 if [[ "${MODEL}" == "pi05" ]]; then
@@ -194,8 +206,24 @@ for name in expected:
     with path.open('rb') as stream:
         for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
             digest.update(block)
-    engines[path.stem] = {'file': path.name, 'sha256': digest.hexdigest(),
-                          'bytes': path.stat().st_size}
+    build_time_path = engine_dir / 'logs' / f'{name}.build_time_seconds'
+    built_at_path = engine_dir / 'logs' / f'{name}.built_at_utc'
+    command_path = engine_dir / 'logs' / f'{name}.command.txt'
+    for metadata_path in (build_time_path, built_at_path, command_path):
+        if not metadata_path.is_file():
+            raise FileNotFoundError(metadata_path)
+    build_elapsed_seconds = float(build_time_path.read_text().strip())
+    if build_elapsed_seconds < 0:
+        raise ValueError(f'Invalid build time for {name}')
+    engines[path.stem] = {
+        'file': path.name,
+        'sha256': digest.hexdigest(),
+        'bytes': path.stat().st_size,
+        'build_elapsed_seconds': build_elapsed_seconds,
+        'built_at_utc': built_at_path.read_text().strip(),
+        'build_command_file': str(command_path.relative_to(engine_dir)),
+        'build_log_file': f'logs/{name}.log',
+    }
 version_process = subprocess.run(
     [trtexec, '--version'], capture_output=True, text=True, check=False)
 version_text = version_process.stdout + version_process.stderr

@@ -116,6 +116,12 @@ class PI05FlowMatchingTensorRTInference(nn.Module):
     def close_inference_runtime(self) -> None:
         self.runtime.close()
 
+    def configure_inference_profile(self, enabled: bool) -> None:
+        self.runtime.configure_inference_profile(enabled)
+
+    def resolve_inference_profile(self):
+        return self.runtime.resolve_inference_profile()
+
     def __del__(self):
         # The runner lifecycle hook performs normal teardown.  Keep this
         # best-effort fallback for direct use or partially constructed models.

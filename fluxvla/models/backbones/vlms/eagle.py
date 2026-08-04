@@ -25,6 +25,14 @@ from transformers.models.qwen3.modeling_qwen3 import (Qwen3Attention,
                                                       Qwen3MLP)
 
 from fluxvla.engines import VLM_BACKBONES, str_to_dtype
+# yapf: disable
+from fluxvla.engines.utils.inference_profile import (begin_module_profile,
+                                                     configure_module_profile,
+                                                     module_stage,
+                                                     resolve_module_profile,
+                                                     start_module_stage,
+                                                     stop_module_stage)
+# yapf: enable
 from fluxvla.models.third_party_models.eagle2_hg_model.modeling_eagle2_5_vl import \
     Eagle2_5_VLForConditionalGeneration  # noqa: E501
 from .hf_vlm import apply_attn_implementation_to_config
@@ -97,6 +105,41 @@ class EagleBackbone(nn.Module):
         # GR00T N1.5-style partial VLM tuning from the config.
         self.tune_llm = tune_llm
         self.tune_visual = tune_visual
+        self._profile_hook_handles = []
+
+    def configure_inference_profile(self, enabled: bool) -> None:
+        """Profile the native ViT and LLM calls without per-layer fences."""
+        configure_module_profile(self, enabled)
+        if not enabled or self._profile_hook_handles:
+            return
+
+        def before(name):
+
+            def hook(_module, _args):
+                start_module_stage(self, name)
+
+            return hook
+
+        def after(name):
+
+            def hook(_module, _args, _output):
+                stop_module_stage(self, name)
+
+            return hook
+
+        for name, module in (('vit', getattr(self.vlm, 'vision_model', None)),
+                             ('llm', getattr(self.vlm, 'language_model',
+                                             None))):
+            if module is None:
+                raise RuntimeError(
+                    f'Eagle module profiling could not locate {name}')
+            self._profile_hook_handles.extend([
+                module.register_forward_pre_hook(before(name)),
+                module.register_forward_hook(after(name)),
+            ])
+
+    def resolve_inference_profile(self):
+        return resolve_module_profile(self)
 
     def apply_trainable_policy(self) -> None:
         """Apply official GR00T N1.5-style VLM tuning if configured."""
@@ -186,23 +229,24 @@ class EagleBackbone(nn.Module):
                 lang_masks: Optional[torch.Tensor] = None,
                 *args,
                 **kwargs) -> BatchFeature:
+        begin_module_profile(self)
         self.set_frozen_modules_to_eval_mode()
+        with module_stage(self, 'backbone_total'):
+            vlm_output = self.vlm(
+                input_ids=lang_tokens,
+                attention_mask=lang_masks,
+                pixel_values=images.reshape(
+                    (images.shape[0] * images.shape[1] // 3, 3,
+                     images.shape[2], images.shape[3])),
+                output_hidden_states=True,
+                return_dict=True)
 
-        vlm_output = self.vlm(
-            input_ids=lang_tokens,
-            attention_mask=lang_masks,
-            pixel_values=images.reshape(
-                (images.shape[0] * images.shape[1] // 3, 3, images.shape[2],
-                 images.shape[3])),
-            output_hidden_states=True,
-            return_dict=True)
+            # YL (TODO HACK): to resolve DDP issue when tune_visual=True
+            # Ensure all trainable parameters in vision_model are used
+            # in the forward pass for DDP compatibility
+            eagle_features = vlm_output.hidden_states[self.select_layer]
 
-        # YL (TODO HACK): to resolve DDP issue when tune_visual=True
-        # Ensure all trainable parameters in vision_model are used
-        # in the forward pass for DDP compatibility
-        eagle_features = vlm_output.hidden_states[self.select_layer]
-
-        eagle_features = self.eagle_linear(eagle_features)
+            eagle_features = self.eagle_linear(eagle_features)
         return eagle_features, lang_masks, None
 
     def enable_gradient_checkpointing(self) -> None:

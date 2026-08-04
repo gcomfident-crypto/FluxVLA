@@ -23,6 +23,14 @@ import torch
 from fluxvla.deployment.tensorrt.groot_n15 import (
     GR00TN15BackboneTensorRTInference, GR00TN15TensorRTContract)
 from fluxvla.engines import VLM_BACKBONES
+# yapf: disable
+from fluxvla.engines.utils.inference_profile import (begin_module_profile,
+                                                     configure_module_profile,
+                                                     module_stage,
+                                                     resolve_module_profile,
+                                                     start_module_stage,
+                                                     stop_module_stage)
+# yapf: enable
 from .eagle import EagleBackbone
 
 
@@ -210,6 +218,7 @@ class EagleTensorRTBackbone(EagleBackbone):
         img_masks: torch.Tensor,
         lang_masks: Optional[torch.Tensor],
     ):
+        begin_module_profile(self)
         if lang_masks is None:
             raise ValueError('lang_masks is required by the TensorRT LLM plan')
         device = self._validate_inputs(images, lang_tokens, img_masks,
@@ -219,12 +228,14 @@ class EagleTensorRTBackbone(EagleBackbone):
         c = self.trt_contract
         stream = torch.cuda.current_stream(device)
         with torch.cuda.stream(stream):
+            start_module_stage(self, 'backbone_total', stream)
             pixel_values = images.reshape(c.image_views, 3, c.image_size,
                                           c.image_size).to(
                                               torch.float16).contiguous()
             position_ids = self._trt_position_ids.contiguous()
-            vit_embeds = self.trt_runtime.run_vision(pixel_values,
-                                                     position_ids, stream)
+            with module_stage(self, 'vit', stream):
+                vit_embeds = self.trt_runtime.run_vision(
+                    pixel_values, position_ids, stream)
 
             if self.vlm.use_pixel_shuffle:
                 height = width = int(vit_embeds.shape[1]**0.5)
@@ -256,8 +267,10 @@ class EagleTensorRTBackbone(EagleBackbone):
             input_embeds = flat_embeds.reshape(c.batch, c.sequence_length,
                                                c.backbone_dim).contiguous()
             attention_mask = lang_masks.to(torch.int64).contiguous()
-            embeddings = self.trt_runtime.run_llm(input_embeds, attention_mask,
-                                                  stream)
+            with module_stage(self, 'llm', stream):
+                embeddings = self.trt_runtime.run_llm(input_embeds,
+                                                      attention_mask, stream)
+            stop_module_stage(self, 'backbone_total', stream)
         return embeddings, lang_masks, None
 
     def bind_eval_checkpoint(self, checkpoint_path) -> None:
@@ -275,6 +288,12 @@ class EagleTensorRTBackbone(EagleBackbone):
 
     def close_inference_runtime(self) -> None:
         self.trt_runtime.close()
+
+    def configure_inference_profile(self, enabled: bool) -> None:
+        configure_module_profile(self, enabled)
+
+    def resolve_inference_profile(self):
+        return resolve_module_profile(self)
 
     def __del__(self):
         runtime = getattr(self, 'trt_runtime', None)

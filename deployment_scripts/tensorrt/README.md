@@ -214,5 +214,8 @@ neural modules represented by the seven engines run through TensorRT.
 - TensorRT configs fail on missing or incompatible engines; they do not
   silently fall back to the PyTorch neural path.
 - TensorRT plans should be rebuilt for the target GPU and TensorRT version.
-- Performance profiling, quantization and cross-GPU validation are outside the
-  current implementation scope.
+- The reproducible PI0.5/GR00T PyTorch-versus-TensorRT experiment, official
+  `trtexec` profiling, Engine Inspector artifacts, and Nsight Systems commands
+  are documented in [BENCHMARK.md](BENCHMARK.md).
+- Quantization and cross-GPU validation are outside the current implementation
+  scope.
