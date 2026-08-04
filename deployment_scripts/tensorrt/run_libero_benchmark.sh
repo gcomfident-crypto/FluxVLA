@@ -267,7 +267,9 @@ build_commands() {
   EVAL_ENV=(
     env
     "CUDA_DEVICE_ORDER=PCI_BUS_ID"
-    "CUDA_VISIBLE_DEVICES=${GPU_UUID:-${GPU}}"
+    # LIBERO's robosuite EGL backend parses this value as an integer. Expose
+    # the requested physical index; CUDA still maps it to logical cuda:0.
+    "CUDA_VISIBLE_DEVICES=${GPU}"
     "WANDB_MODE=disabled"
     "WANDB_DISABLED=true"
     "WANDB_SILENT=true"
@@ -337,7 +339,7 @@ write_metadata() {
     printf 'physical_gpu_index=%s\n' "${GPU}"
     printf 'physical_gpu_uuid=%s\n' "${GPU_UUID}"
     printf 'CUDA_DEVICE_ORDER=PCI_BUS_ID\n'
-    printf 'CUDA_VISIBLE_DEVICES=%s\n' "${GPU_UUID}"
+    printf 'CUDA_VISIBLE_DEVICES=%s\n' "${GPU}"
     printf 'visible_torch_device=cuda:0\n'
     printf 'WANDB_MODE=disabled\n'
     printf 'WANDB_DISABLED=true\n'
@@ -410,7 +412,7 @@ run_preflight_smoke() {
   local smoke_env=(
     env
     "CUDA_DEVICE_ORDER=PCI_BUS_ID"
-    "CUDA_VISIBLE_DEVICES=${GPU_UUID}"
+    "CUDA_VISIBLE_DEVICES=${GPU}"
     "MUJOCO_GL=egl"
     "TOKENIZERS_PARALLELISM=false"
     "PYTHONUNBUFFERED=1"
