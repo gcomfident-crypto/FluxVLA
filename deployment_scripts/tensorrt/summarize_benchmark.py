@@ -15,11 +15,11 @@
 """Validate and summarize formal and diagnostic LIBERO benchmark runs.
 
 Four formal evaluation inputs provide success rates and end-to-end latency.
-Four separate module-profile inputs provide CUDA-event module metrics.  Each
-input resolves from either a direct evaluation ``run_dir`` or a
-``run_libero_benchmark.sh`` group wrapper; formal inputs must also expose the
+Four separate module-profile inputs provide CUDA-event module metrics.  Every
+input must be a completed ``run_libero_benchmark.sh`` group wrapper whose
+``status.txt`` starts with ``SUCCESS``; formal inputs must also expose the
 wrapper's ``telemetry.csv``.  Warm-up inference rows are excluded from every
-latency statistic.  The generated figure is rendered from the emitted
+latency statistic.  The generated model figures are rendered from the emitted
 ``figure_source.csv`` so every plotted number has a machine-readable source.
 """
 
@@ -38,6 +38,14 @@ from statistics import fmean, pstdev
 from typing import Iterable, Mapping, Sequence
 
 SCHEMA_VERSION = 1
+# These are the exact ``model`` values passed as ``eval.time_profile_model``
+# by run_libero_benchmark.sh and serialized by LiberoEvalRunner.
+EXPECTED_SOURCE_MODEL_BY_KEY = {
+    'pi05': 'pi05',
+    'groot': 'gr00t',
+}
+MODULE_EXPECTED_TASKS = 10
+MODULE_EXPECTED_TRIALS_PER_TASK = 1
 
 PIPELINE_COMPONENTS = (
     'preprocess_ms',
@@ -212,6 +220,72 @@ class LoadedModuleGroup:
 
 class BenchmarkValidationError(ValueError):
     """Raised when profiler CSV data violates the benchmark contract."""
+
+
+def _validate_wrapper_success(requested: Path, cli_option: str) -> Path:
+    """Require the benchmark wrapper's first status token to be SUCCESS."""
+    status_path = requested / 'status.txt'
+    if not status_path.is_file():
+        raise BenchmarkValidationError(
+            f'{cli_option}: benchmark wrapper is missing status.txt: '
+            f'{requested}')
+    try:
+        with status_path.open(encoding='utf-8') as stream:
+            first_line = stream.readline().strip()
+    except UnicodeError as exc:
+        raise BenchmarkValidationError(
+            f'{cli_option}: status.txt is not valid UTF-8: {status_path}') \
+            from exc
+    first_token = first_line.split(maxsplit=1)[0] if first_line else ''
+    if first_token != 'SUCCESS':
+        raise BenchmarkValidationError(
+            f'{cli_option}: benchmark wrapper status must start with the '
+            f'token SUCCESS, got {first_line!r}: {status_path}')
+    return status_path
+
+
+def _validate_source_model(spec: GroupSpec, rows: Sequence[dict],
+                           context: str) -> str:
+    """Require the profiler model label emitted by the benchmark runner."""
+    expected_model = EXPECTED_SOURCE_MODEL_BY_KEY[spec.model_key]
+    observed_models = {row['model'] for row in rows}
+    if observed_models != {expected_model}:
+        raise BenchmarkValidationError(
+            f'{spec.key}{context}: expected model={expected_model!r}, found '
+            f'{sorted(observed_models)}')
+    return expected_model
+
+
+def _validate_module_trial_contract(spec: GroupSpec,
+                                    trials: Sequence[dict]) -> None:
+    """Require one completed diagnostic trial for each of ten tasks."""
+    expected_trials = MODULE_EXPECTED_TASKS * MODULE_EXPECTED_TRIALS_PER_TASK
+    if len(trials) != expected_trials:
+        raise BenchmarkValidationError(
+            f'{spec.key} module profile: expected {expected_trials} completed '
+            f'trials ({MODULE_EXPECTED_TASKS} tasks x '
+            f'{MODULE_EXPECTED_TRIALS_PER_TASK}), found {len(trials)}')
+    per_task: dict[int, int] = defaultdict(int)
+    for trial in trials:
+        if trial.get('status') != 'completed':
+            raise BenchmarkValidationError(
+                f'{spec.key} module profile: every diagnostic trial must '
+                f'have status=completed, found {trial.get("status")!r}')
+        per_task[trial['task_id']] += 1
+    if len(per_task) != MODULE_EXPECTED_TASKS:
+        raise BenchmarkValidationError(
+            f'{spec.key} module profile: expected {MODULE_EXPECTED_TASKS} '
+            f'distinct tasks, found {len(per_task)} ({sorted(per_task)})')
+    bad_counts = {
+        task_id: count
+        for task_id, count in per_task.items()
+        if count != MODULE_EXPECTED_TRIALS_PER_TASK
+    }
+    if bad_counts:
+        raise BenchmarkValidationError(
+            f'{spec.key} module profile: expected exactly '
+            f'{MODULE_EXPECTED_TRIALS_PER_TASK} completed trial per task, '
+            f'got {bad_counts}')
 
 
 def _required_call_columns(module_keys: Sequence[str] = ()) -> set[str]:
@@ -786,11 +860,7 @@ def _validate_group(spec: GroupSpec, calls: list[dict], trials: list[dict],
         raise BenchmarkValidationError(
             f'{spec.key}: expected backend={spec.backend!r}, found '
             f'{sorted(backends)}')
-    models = {row['model'] for row in [*calls, *trials]}
-    if len(models) != 1:
-        raise BenchmarkValidationError(
-            f'{spec.key}: model column is inconsistent: {sorted(models)}')
-    source_model = next(iter(models))
+    source_model = _validate_source_model(spec, [*calls, *trials], '')
 
     measured_calls = [row for row in calls if not row['warmup']]
     if not measured_calls:
@@ -861,7 +931,8 @@ def _load_group(spec: GroupSpec, expected_trials: int, expected_tasks: int,
 def _validate_module_group(spec: GroupSpec, calls: list[dict],
                            trials: list[dict], abs_tol_ms: float,
                            rel_tol: float) -> LoadedModuleGroup:
-    """Validate a diagnostic run without imposing formal trial counts."""
+    """Validate the fixed ten-task, one-trial-per-task diagnostic run."""
+    _validate_module_trial_contract(spec, trials)
     trial_by_id = {}
     for trial in trials:
         key = (trial['task_id'], trial['trial_id'])
@@ -900,12 +971,8 @@ def _validate_module_group(spec: GroupSpec, calls: list[dict],
         raise BenchmarkValidationError(
             f'{spec.key} module profile: expected backend={spec.backend!r}, '
             f'found {sorted(backends)}')
-    models = {row['model'] for row in [*calls, *trials]}
-    if len(models) != 1:
-        raise BenchmarkValidationError(
-            f'{spec.key} module profile: model column is inconsistent: '
-            f'{sorted(models)}')
-    source_model = next(iter(models))
+    source_model = _validate_source_model(spec, [*calls, *trials],
+                                          ' module profile')
 
     measured_calls = [row for row in calls if not row['warmup']]
     if not measured_calls:
@@ -1190,11 +1257,14 @@ def _apply_module_comparisons(module_rows: list[dict],
     repeated_children = {
         'denoise_step', 'action_encoder', 'dit', 'action_decoder'
     }
-    overall_index = {(row['model_family'], row['backend']): row
-                     for row in overall_rows}
-    module_index = {(row['model_family'], row['module_key'], row['backend']):
-                    row
-                    for row in module_rows}
+    overall_index = {
+        (row['model_family'], row['backend']): row
+        for row in overall_rows
+    }
+    module_index = {
+        (row['model_family'], row['module_key'], row['backend']): row
+        for row in module_rows
+    }
     pair_keys = {(row['model_family'], row['module_key'])
                  for row in module_rows}
     for model_family, module_key in sorted(pair_keys):
@@ -1337,6 +1407,11 @@ FIGURE_SOURCE_FIELDS = [
     'module_source_inference_calls', 'module_source_trials', 'warmup_filter'
 ]
 
+FIGURE_EXPORTS = (
+    ('pi05', 0, 'PI0.5', 'pi05_pytorch_vs_tensorrt_latency'),
+    ('groot', 1, 'GR00T-N1.5', 'groot_n15_pytorch_vs_tensorrt_latency'),
+)
+
 
 def _write_csv(path: Path, fields: Sequence[str],
                rows: Iterable[Mapping]) -> None:
@@ -1351,7 +1426,8 @@ def _write_csv(path: Path, fields: Sequence[str],
         writer.writeheader()
         for row in rows:
             writer.writerow({
-                field: '' if row.get(field) is None else row.get(field)
+                field:
+                '' if row.get(field) is None else row.get(field)
                 for field in fields
             })
     os.replace(temporary, path)
@@ -1361,12 +1437,14 @@ def _build_figure_source(groups: Sequence[LoadedGroup],
                          module_groups: Sequence[LoadedModuleGroup],
                          module_rows: Sequence[dict],
                          overall_rows: Sequence[dict]) -> list[dict]:
-    module_index = {(row['group_id'], row['module_key']): row
-                    for row in module_rows}
+    module_index = {
+        (row['group_id'], row['module_key']): row
+        for row in module_rows
+    }
     overall_index = {row['group_id']: row for row in overall_rows}
     module_group_index = {group.spec.key: group for group in module_groups}
     result = []
-    for panel_order, model_key in enumerate(('pi05', 'groot')):
+    for model_key, panel_order, _, figure_id in FIGURE_EXPORTS:
         panel_label = '(a) PI0.5' if model_key == 'pi05' else '(b) GR00T-N1.5'
         model_groups = [
             group for group in groups if group.spec.model_key == model_key
@@ -1388,7 +1466,7 @@ def _build_figure_source(groups: Sequence[LoadedGroup],
                     source_run_dir = str(module_group.spec.run_dir)
                 row = {
                     'figure_id':
-                    'vla_pytorch_vs_tensorrt_latency',
+                    figure_id,
                     'panel_order':
                     panel_order,
                     'panel_label':
@@ -1512,16 +1590,20 @@ def _validate_figure_trace(figure_rows: Sequence[dict],
     if len(figure_rows) != len(source_rows):
         raise BenchmarkValidationError(
             'figure_source.csv row count changed after serialization')
-    module_index = {(row['group_id'], row['module_key']): row
-                    for row in module_rows}
+    module_index = {
+        (row['group_id'], row['module_key']): row
+        for row in module_rows
+    }
     overall_index = {row['group_id']: row for row in overall_rows}
     module_source_by_group = {}
     for module in module_rows:
         module_source_by_group.setdefault(module['group_id'], module)
     expected_keys = {(row['group_id'], row['segment_key'])
                      for row in source_rows}
-    source_index = {(row['group_id'], row['segment_key']): row
-                    for row in source_rows}
+    source_index = {
+        (row['group_id'], row['segment_key']): row
+        for row in source_rows
+    }
     actual_keys = {(row['group_id'], row['segment_key'])
                    for row in figure_rows}
     if actual_keys != expected_keys:
@@ -1612,18 +1694,18 @@ def _validate_figure_trace(figure_rows: Sequence[dict],
         if row['module_source_run_dir'] != module_source['source_run_dir']:
             raise BenchmarkValidationError(
                 f'figure trace {key}: module source run_dir mismatch')
-        if (row['formal_measured_inference_calls'] !=
-                overall['measured_inference_calls']):
+        if (row['formal_measured_inference_calls']
+                != overall['measured_inference_calls']):
             raise BenchmarkValidationError(
                 f'figure trace {key}: formal call count mismatch')
-        if (row['module_measured_inference_calls'] !=
-                module_source['measured_inference_calls']):
+        if (row['module_measured_inference_calls']
+                != module_source['measured_inference_calls']):
             raise BenchmarkValidationError(
                 f'figure trace {key}: module call count mismatch')
 
 
-def _render_figure(figure_source_path: Path, svg_path: Path,
-                   png_path: Path) -> None:
+def _render_model_figure(figure_source_path: Path, model_key: str,
+                         svg_path: Path, png_path: Path) -> None:
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -1632,6 +1714,17 @@ def _render_figure(figure_source_path: Path, svg_path: Path,
     except ImportError as exc:
         raise RuntimeError(
             'matplotlib is required to generate benchmark figures') from exc
+
+    export_specs = {
+        key: (panel_order, label, stem)
+        for key, panel_order, label, stem in FIGURE_EXPORTS
+    }
+    if model_key not in export_specs:
+        raise BenchmarkValidationError(
+            f'Unknown figure model {model_key!r}; expected '
+            f'{sorted(export_specs)}')
+    selected_panel_order, model_label, expected_figure_id = export_specs[
+        model_key]
 
     rows = _read_figure_source(figure_source_path)
     panels: dict[int,
@@ -1643,6 +1736,17 @@ def _render_figure(figure_source_path: Path, svg_path: Path,
         raise BenchmarkValidationError(
             'Figure source must contain panels 0 and 1, found '
             f'{sorted(panels)}')
+    selected_rows = [
+        row for row in rows if row['panel_order'] == selected_panel_order
+    ]
+    if not selected_rows:
+        raise BenchmarkValidationError(
+            f'Figure source contains no rows for {model_label}')
+    figure_ids = {row['figure_id'] for row in selected_rows}
+    if figure_ids != {expected_figure_id}:
+        raise BenchmarkValidationError(
+            f'{model_label} figure_id mismatch: {sorted(figure_ids)} != '
+            f'{expected_figure_id!r}')
 
     plt.rcParams.update({
         'font.family': 'DejaVu Sans',
@@ -1653,15 +1757,10 @@ def _render_figure(figure_source_path: Path, svg_path: Path,
         'figure.facecolor': 'white',
         'axes.facecolor': '#FAFAFA',
     })
-    figure = plt.figure(figsize=(18.0, 7.0), constrained_layout=False)
-    grid = figure.add_gridspec(
-        1, 4, width_ratios=(3.7, 2.35, 3.7, 2.35), wspace=0.07)
-    bar_axes = []
-    info_axes = []
-    bar_axes.append(figure.add_subplot(grid[0, 0]))
-    info_axes.append(figure.add_subplot(grid[0, 1]))
-    bar_axes.append(figure.add_subplot(grid[0, 2]))
-    info_axes.append(figure.add_subplot(grid[0, 3]))
+    figure = plt.figure(figsize=(9.0, 7.0), constrained_layout=False)
+    grid = figure.add_gridspec(1, 2, width_ratios=(3.7, 2.35), wspace=0.07)
+    bar_axis = figure.add_subplot(grid[0, 0])
+    info_axis = figure.add_subplot(grid[0, 1])
     marker_handles = [
         Line2D([0], [0],
                color='#222222',
@@ -1685,9 +1784,8 @@ def _render_figure(figure_source_path: Path, svg_path: Path,
                label='Pipeline P50–P95'),
     ]
 
-    for panel_order in (0, 1):
-        axis = bar_axes[panel_order]
-        info_axis = info_axes[panel_order]
+    for panel_order in (selected_panel_order, ):
+        axis = bar_axis
         panel_groups = list(panels[panel_order].values())
         panel_groups.sort(key=lambda group: group[0]['backend_order'])
         if len(panel_groups) != 2:
@@ -1707,8 +1805,7 @@ def _render_figure(figure_source_path: Path, svg_path: Path,
             raise BenchmarkValidationError(
                 f'Panel {panel_order} latencies must be positive')
         x_limit = panel_max * 1.10
-        panel_label = panel_groups[0][0]['panel_label']
-        axis.set_title(panel_label, loc='left', fontweight='bold', pad=16)
+        axis.set_title(model_label, loc='left', fontweight='bold', pad=16)
         y_positions = {0: 1.0, 1: 0.0}
         for group_rows in panel_groups:
             group_rows.sort(key=lambda row: row['segment_order'])
@@ -1875,7 +1972,7 @@ def _render_figure(figure_source_path: Path, svg_path: Path,
         info_axis.axis('off')
 
     figure.suptitle(
-        'LIBERO inference latency: PyTorch vs TensorRT',
+        f'{model_label} LIBERO inference latency: PyTorch vs TensorRT',
         fontsize=16,
         fontweight='bold',
         y=0.99)
@@ -1889,7 +1986,7 @@ def _render_figure(figure_source_path: Path, svg_path: Path,
     figure.text(
         0.5,
         0.025, 'Gray/pink/orange edge stages: formal-run means; neural '
-        'stages: diagnostic module means. Each panel has its own scale. '
+        'stages: diagnostic module means. '
         'Source: figure_source.csv; warmup=1 excluded.',
         ha='center',
         va='bottom',
@@ -1902,8 +1999,9 @@ def _render_figure(figure_source_path: Path, svg_path: Path,
         format='svg',
         bbox_inches='tight',
         metadata={
-            'Title': 'LIBERO PyTorch versus TensorRT latency',
-            'Description': 'Rendered from figure_source.csv'
+            'Title': f'{model_label} LIBERO PyTorch versus TensorRT latency',
+            'Description':
+            (f'{model_label} rows rendered from figure_source.csv')
         })
     figure.savefig(
         png_path,
@@ -1912,8 +2010,9 @@ def _render_figure(figure_source_path: Path, svg_path: Path,
         bbox_inches='tight',
         facecolor='white',
         metadata={
-            'Title': 'LIBERO PyTorch versus TensorRT latency',
-            'Description': 'Rendered from figure_source.csv'
+            'Title': f'{model_label} LIBERO PyTorch versus TensorRT latency',
+            'Description':
+            (f'{model_label} rows rendered from figure_source.csv')
         })
     plt.close(figure)
     for path in (svg_path, png_path):
@@ -1942,10 +2041,21 @@ def _build_report(groups: Sequence[LoadedGroup],
     lines = [
         '# LIBERO PyTorch vs TensorRT Benchmark',
         '',
-        '![PI0.5 and GR00T-N1.5 latency comparison]'
-        '(assets/vla_pytorch_vs_tensorrt_latency.png)',
+        '## PI0.5 latency breakdown',
         '',
-        '[SVG vector export](assets/vla_pytorch_vs_tensorrt_latency.svg)',
+        '![PI0.5 PyTorch vs TensorRT latency breakdown]'
+        '(assets/pi05_pytorch_vs_tensorrt_latency.png)',
+        '',
+        '[PI0.5 SVG vector export]'
+        '(assets/pi05_pytorch_vs_tensorrt_latency.svg)',
+        '',
+        '## GR00T-N1.5 latency breakdown',
+        '',
+        '![GR00T-N1.5 PyTorch vs TensorRT latency breakdown]'
+        '(assets/groot_n15_pytorch_vs_tensorrt_latency.png)',
+        '',
+        '[GR00T-N1.5 SVG vector export]'
+        '(assets/groot_n15_pytorch_vs_tensorrt_latency.svg)',
         '',
         '## Overall comparison',
         '',
@@ -2077,7 +2187,7 @@ def _build_report(groups: Sequence[LoadedGroup],
         'ViT → LLM → Backbone Processor → State Encoder → Action '
         'Expert (Action Encoder → DiT → Decoder ×4) → Output Transfer '
         '→ Action Denorm. PyTorch and TensorRT share a scale within each '
-        'model; the two model panels use independent scales.',
+        'model; the two model figures use independent scales.',
         '- Module comparison scope is `per_invocation` for PI0.5 Denoise '
         'step and GR00T Action Encoder/DiT/Action Decoder; other rows are '
         '`per_inference`. Share and saving-contribution fields always use '
@@ -2093,16 +2203,19 @@ def _build_report(groups: Sequence[LoadedGroup],
         f'unique trials and {expected_tasks} tasks; each group-specific trial '
         f'CSV has {expected_trials} rows and each task summary has '
         f'{expected_tasks} rows.',
+        '- PASS: all eight benchmark-wrapper `status.txt` files begin with '
+        'the exact token `SUCCESS`.',
         '- PASS: every formal and diagnostic trial has `status=completed` '
         'with blank `error_type` and `error_message`; interrupted, running, '
         'or failed trials are rejected before summarization.',
         f'- PASS: all {total_trials} formal trials have at least one '
         f'episode-window telemetry sample ({telemetry_samples} associated '
         'samples across the four overall summaries).',
-        '- PASS: four distinct diagnostic runs have `module_profile=1`; all '
-        'plotted modules are complete after warm-up filtering; PI0.5 '
-        '`denoise_step` executes 10 times and each GR00T action-expert child '
-        'executes 4 times per measured inference.',
+        '- PASS: four distinct diagnostic runs each contain exactly 10 '
+        'completed trials across 10 tasks (one per task) and have '
+        '`module_profile=1`; all plotted modules are complete after warm-up '
+        'filtering; PI0.5 `denoise_step` executes 10 times and each GR00T '
+        'action-expert child executes 4 times per measured inference.',
         f'- PASS: {formal_pipeline_rows_checked} formal and '
         f'{module_pipeline_rows_checked} diagnostic measured inference rows '
         'satisfy '
@@ -2111,7 +2224,8 @@ def _build_report(groups: Sequence[LoadedGroup],
         '- PASS: formal and diagnostic trial aggregates match their '
         'call-level CSV data; diagnostic module mean values match '
         '`module_ms / module_calls`.',
-        f'- PASS: both figure formats were rendered by re-reading all '
+        f'- PASS: both model figures in PNG and SVG were rendered by '
+        f're-reading all '
         f'{figure_segment_rows} segment rows in `figure_source.csv`; every '
         'segment role, value, repeat count, and formal/diagnostic source path '
         'is checked against its upstream summary.',
@@ -2147,10 +2261,10 @@ def _build_report(groups: Sequence[LoadedGroup],
                      'Not used |')
     lines.extend([
         '',
-        'Inputs may resolve directly or through a group wrapper. Formal '
-        'inputs must expose the wrapper-produced `telemetry.csv`; a direct '
-        'formal eval without telemetry is rejected. Wrapper resolution is '
-        'restricted to a unique qualifying directory below '
+        'All eight inputs must be completed group wrappers whose '
+        '`status.txt` begins with `SUCCESS`. Formal inputs must expose the '
+        'wrapper-produced `telemetry.csv`. Each wrapper resolves through its '
+        '`time_profile` link or a unique qualifying directory below '
         '`results/eval_runs`.',
         '',
         '## Generated artifacts',
@@ -2167,10 +2281,11 @@ def _build_report(groups: Sequence[LoadedGroup],
         '- `module_comparison.csv` — top-level and nested CUDA-event module '
         'statistics, using diagnostic runs only.',
         f'- `figure_source.csv` — {figure_segment_rows} traceable segment '
-        'rows consumed by the figure.',
-        '- `assets/vla_pytorch_vs_tensorrt_latency.png` and `.svg` — '
-        'color-vision-safe raster and vector exports; the report embeds PNG '
-        'by default and links the SVG.',
+        'rows consumed by both model figures.',
+        '- `assets/pi05_pytorch_vs_tensorrt_latency.{png,svg}` and '
+        '`assets/groot_n15_pytorch_vs_tensorrt_latency.{png,svg}` — '
+        'model-specific color-vision-safe raster and vector exports; the '
+        'report embeds both PNG files and links both SVG files.',
         '',
     ])
     return '\n'.join(lines)
@@ -2185,11 +2300,12 @@ def _write_text(path: Path, value: str) -> None:
 
 def _resolve_eval_run_dir(raw: Path,
                           cli_option: str) -> tuple[Path, Path, Path | None]:
-    """Resolve a direct eval run or a benchmark group wrapper strictly."""
+    """Resolve a completed benchmark group wrapper strictly."""
     requested = Path(raw).expanduser().resolve()
     if not requested.is_dir():
         raise BenchmarkValidationError(
             f'{cli_option}: input directory does not exist: {requested}')
+    _validate_wrapper_success(requested, cli_option)
 
     direct_profile = requested / 'time_profile'
     required_names = ('inference_calls.csv', 'trials.csv')
@@ -2348,9 +2464,10 @@ def summarize(args: argparse.Namespace) -> list[Path]:
         'module': output_dir / 'module_comparison.csv',
         'figure_source': output_dir / 'figure_source.csv',
         'report': output_dir / 'REPORT.md',
-        'svg': assets_dir / 'vla_pytorch_vs_tensorrt_latency.svg',
-        'png': assets_dir / 'vla_pytorch_vs_tensorrt_latency.png',
     }
+    for model_key, _, _, stem in FIGURE_EXPORTS:
+        output_paths[f'{model_key}_svg'] = assets_dir / f'{stem}.svg'
+        output_paths[f'{model_key}_png'] = assets_dir / f'{stem}.png'
     for group in groups:
         trial_key = f'{group.spec.key}_trial'
         task_key = f'{group.spec.key}_task'
@@ -2371,8 +2488,10 @@ def summarize(args: argparse.Namespace) -> list[Path]:
     _validate_figure_trace(serialized_figure_rows, figure_source_rows,
                            module_rows, overall_rows, args.pipeline_abs_tol_ms,
                            args.pipeline_rel_tol)
-    _render_figure(output_paths['figure_source'], output_paths['svg'],
-                   output_paths['png'])
+    for model_key, _, _, _ in FIGURE_EXPORTS:
+        _render_model_figure(output_paths['figure_source'], model_key,
+                             output_paths[f'{model_key}_svg'],
+                             output_paths[f'{model_key}_png'])
     report = _build_report(groups, module_groups, overall_rows, module_rows,
                            args.gpu, args.precision, args.timing_boundaries,
                            args.expected_trials_per_group,
@@ -2395,22 +2514,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         '--pi05-pytorch',
         required=True,
         type=Path,
-        help='PI0.5 PyTorch formal wrapper with telemetry.csv.')
+        help='Completed PI0.5 PyTorch formal wrapper with telemetry.csv.')
     parser.add_argument(
         '--pi05-tensorrt',
         required=True,
         type=Path,
-        help='PI0.5 TensorRT formal wrapper with telemetry.csv.')
+        help='Completed PI0.5 TensorRT formal wrapper with telemetry.csv.')
     parser.add_argument(
         '--groot-pytorch',
         required=True,
         type=Path,
-        help='GR00T-N1.5 PyTorch formal wrapper with telemetry.csv.')
+        help='Completed GR00T-N1.5 PyTorch formal wrapper with telemetry.csv.')
     parser.add_argument(
         '--groot-tensorrt',
         required=True,
         type=Path,
-        help='GR00T-N1.5 TensorRT formal wrapper with telemetry.csv.')
+        help='Completed GR00T-N1.5 TensorRT formal wrapper with telemetry.csv.'
+    )
     parser.add_argument(
         '--pi05-pytorch-module-profile',
         '--pi05-pytorch-module-run-dir',
@@ -2418,7 +2538,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest='pi05_pytorch_module_profile',
         required=True,
         type=Path,
-        help='Independent PI0.5 PyTorch module-profile run_dir.')
+        help='Completed independent PI0.5 PyTorch module-profile wrapper.')
     parser.add_argument(
         '--pi05-tensorrt-module-profile',
         '--pi05-tensorrt-module-run-dir',
@@ -2426,7 +2546,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest='pi05_tensorrt_module_profile',
         required=True,
         type=Path,
-        help='Independent PI0.5 TensorRT module-profile run_dir.')
+        help='Completed independent PI0.5 TensorRT module-profile wrapper.')
     parser.add_argument(
         '--groot-pytorch-module-profile',
         '--groot-pytorch-module-run-dir',
@@ -2434,7 +2554,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest='groot_pytorch_module_profile',
         required=True,
         type=Path,
-        help='Independent GR00T-N1.5 PyTorch module-profile run_dir.')
+        help='Completed independent GR00T-N1.5 PyTorch module-profile wrapper.'
+    )
     parser.add_argument(
         '--groot-tensorrt-module-profile',
         '--groot-tensorrt-module-run-dir',
@@ -2442,7 +2563,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest='groot_tensorrt_module_profile',
         required=True,
         type=Path,
-        help='Independent GR00T-N1.5 TensorRT module-profile run_dir.')
+        help='Completed independent GR00T-N1.5 TensorRT module-profile wrapper.'
+    )
     parser.add_argument(
         '--output-dir',
         required=True,

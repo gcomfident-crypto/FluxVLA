@@ -321,8 +321,10 @@ bash deployment_scripts/tensorrt/run_libero_benchmark.sh \
   --mode module
 ```
 
-This pass records one diagnostic trial for each of the 10 tasks and four
-groups. The module comparison includes:
+This pass records one completed diagnostic trial for each of the 10 tasks and
+four groups. The summarizer rejects a diagnostic group unless it contains
+exactly 10 completed trials across 10 distinct tasks, one trial per task. The
+module comparison includes:
 
 | Model | Stages |
 | --- | --- |
@@ -385,16 +387,20 @@ python -m deployment_scripts.tensorrt.summarize_benchmark \
   --expected-tasks-per-group 10
 ```
 
-The command rejects missing/duplicate trials, the wrong backend/model labels,
+The command requires all eight input wrappers to have a `status.txt` whose
+first token is exactly `SUCCESS`. It rejects missing/duplicate trials,
+diagnostic groups other than 10 tasks x one completed trial, the wrong backend
+or exact profiler model label (`pi05` for PI0.5 and `gr00t` for GR00T-N1.5),
 inconsistent pipeline arithmetic, missing required module values, and a figure
 whose serialized source no longer matches the summary tables. It computes
 PyTorch-versus-TensorRT speedups but imposes no speedup or success threshold.
 
-`REPORT.md` embeds a two-panel latency figure similar in purpose to NVIDIA's
-VLA deployment diagram: one PI0.5 panel and one GR00T-N1.5 panel, each showing
-PyTorch and TensorRT module timing plus formal model/pipeline markers. The
-figure is generated only from `figure_source.csv`, which retains paths back to
-the formal and diagnostic raw inputs. No HTML is generated.
+`REPORT.md` embeds two model-specific latency figures similar in purpose to
+NVIDIA's VLA deployment diagram: one for PI0.5 and one for GR00T-N1.5. Each
+figure shows PyTorch and TensorRT module timing plus formal model/pipeline
+markers. Both figures are generated only from `figure_source.csv`, which
+retains paths back to the formal and diagnostic raw inputs. Each figure is
+exported as PNG and SVG; no HTML is generated.
 
 ## 10. Artifact contract
 
@@ -447,15 +453,18 @@ ${BENCH_ROOT}/
     |-- *_trial_results.csv
     |-- *_task_summary.csv
     `-- assets/
-        |-- vla_pytorch_vs_tensorrt_latency.svg
-        `-- vla_pytorch_vs_tensorrt_latency.png
+        |-- pi05_pytorch_vs_tensorrt_latency.svg
+        |-- pi05_pytorch_vs_tensorrt_latency.png
+        |-- groot_n15_pytorch_vs_tensorrt_latency.svg
+        `-- groot_n15_pytorch_vs_tensorrt_latency.png
 ```
 
 Each LIBERO group directory must contain `command.txt`, `env.txt`,
 `git_commit.txt`, `git_status.txt`, `stdout.log`, `telemetry.csv`,
 `status.txt`, and a `time_profile/` link with `inference_calls.csv` and
-`trials.csv`. A group is complete only when `status.txt` begins with
-`SUCCESS`.
+`trials.csv`. A group is complete only when the first token on the first line
+of `status.txt` is exactly `SUCCESS`; the summarizer enforces this for all
+eight formal and module-diagnostic inputs.
 
 Retain raw CSV/JSON/log inputs with the derived report. Do not edit generated
 numbers or the SVG/PNG by hand. If a long run fails, preserve the partial
