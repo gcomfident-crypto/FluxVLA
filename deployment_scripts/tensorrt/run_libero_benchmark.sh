@@ -23,6 +23,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 INVOCATION_DIR="${PWD}"
+PROJECT_PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 PI_PYTORCH_CONFIG="${PROJECT_ROOT}/configs/pi05/pi05_paligemma_libero_10_full_finetune.py"
 PI_TENSORRT_CONFIG="${PROJECT_ROOT}/configs/pi05/pi05_paligemma_libero_10_tensorrt.py"
@@ -274,6 +275,7 @@ build_commands() {
     "TOKENIZERS_PARALLELISM=false"
     "OMP_NUM_THREADS=1"
     "PYTHONUNBUFFERED=1"
+    "PYTHONPATH=${PROJECT_PYTHONPATH}"
   )
   EVAL_COMMAND=(
     torchrun
@@ -340,6 +342,7 @@ write_metadata() {
     printf 'WANDB_MODE=disabled\n'
     printf 'WANDB_DISABLED=true\n'
     printf 'OMP_NUM_THREADS=1\n'
+    printf 'PYTHONPATH=%s\n' "${PROJECT_PYTHONPATH}"
     printf 'timezone=%s\n' "$(date +%Z%z)"
     printf 'python_executable=%s\n' "$(command -v python)"
     python --version 2>&1
@@ -411,6 +414,7 @@ run_preflight_smoke() {
     "MUJOCO_GL=egl"
     "TOKENIZERS_PARALLELISM=false"
     "PYTHONUNBUFFERED=1"
+    "PYTHONPATH=${PROJECT_PYTHONPATH}"
   )
   local pi_command=(
     python -m deployment_scripts.tensorrt.smoke_test pi05
@@ -438,6 +442,34 @@ run_preflight_smoke() {
     cd "${PROJECT_ROOT}"
     "${smoke_env[@]}" "${gr_command[@]}"
   ) 2>&1 | tee "${OUTPUT_ROOT}/preflight_groot_smoke.log"
+}
+
+assert_project_import_identity() {
+  (
+    cd "${PROJECT_ROOT}"
+    env "PYTHONPATH=${PROJECT_PYTHONPATH}" python - "${PROJECT_ROOT}" <<'PY'
+import importlib
+import pathlib
+import sys
+
+project_root = pathlib.Path(sys.argv[1]).resolve()
+module_names = (
+    'fluxvla',
+    'fluxvla.engines.utils.builder',
+    'fluxvla.engines.runners.libero_eval_runner',
+)
+for module_name in module_names:
+    module = importlib.import_module(module_name)
+    module_path = pathlib.Path(module.__file__).resolve()
+    try:
+        module_path.relative_to(project_root)
+    except ValueError as error:
+        raise RuntimeError(
+            f'{module_name} resolved outside the benchmark checkout: '
+            f'{module_path}') from error
+    print(f'{module_name}={module_path}')
+PY
+  ) > "${OUTPUT_ROOT}/import_identity.txt"
 }
 
 run_group() {
@@ -579,6 +611,7 @@ preflight() {
   GIT_COMMIT_SNAPSHOT="$(git -C "${PROJECT_ROOT}" rev-parse HEAD)"
   GIT_STATUS_SNAPSHOT="$(git -C "${PROJECT_ROOT}" status --short --branch)"
   mkdir -p "${OUTPUT_ROOT}"
+  assert_project_import_identity
   nvidia-smi "--id=${GPU_UUID}" \
     --query-gpu=index,uuid,name,pci.bus_id,driver_version,utilization.gpu,memory.used,memory.total \
     --format=csv,noheader > "${OUTPUT_ROOT}/gpu_preflight.csv"
