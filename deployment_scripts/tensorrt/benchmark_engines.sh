@@ -93,7 +93,17 @@ PY
     nvidia-smi --query-gpu=index,name,uuid,driver_version,memory.total \
         --format=csv,noheader
 } >"${OUTPUT_DIR}/gpu_environment.txt"
-"${TRTEXEC}" --version >"${OUTPUT_DIR}/trtexec_version.txt" 2>&1
+version_file="${OUTPUT_DIR}/trtexec_version.txt"
+if ! "${TRTEXEC}" --version >"${version_file}" 2>&1; then
+    # TensorRT 10.13 prints its version but exits non-zero because trtexec
+    # continues into argument validation and reports that no model was given.
+    # Accept that known CLI behaviour only when a parseable version is present.
+    if ! grep -Eq 'TensorRT v[0-9]+' "${version_file}"; then
+        cat "${version_file}"
+        echo "Could not determine the trtexec TensorRT version."
+        exit 1
+    fi
+fi
 
 for name in "${ENGINES[@]}"; do
     engine="${ENGINE_DIR}/${name}.engine"
@@ -108,7 +118,6 @@ for name in "${ENGINES[@]}"; do
         --iterations=100 \
         --useSpinWait \
         --noDataTransfers \
-        --noCudaGraph \
         --separateProfileRun \
         --dumpProfile \
         --exportTimes="${OUTPUT_DIR}/${name}_times.json" \
