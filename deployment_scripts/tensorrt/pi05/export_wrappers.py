@@ -11,13 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""ONNX-exportable model partitions for PI0.5 and GR00T-N1.5.
+"""ONNX-exportable Vision, Prefix and Denoise partitions for PI0.5.
 
-GR00T follows NVIDIA's seven-engine split from
-``Isaac-GR00T/deployment_scripts``.  PI0.5 uses an analogous three-engine
-split: vision/projector (V), prefix KV cache (P), and one Euler denoising
-step (D).  Only ordinary PyTorch tensor operations are used here; this module
-does not import TensorRT, Triton, or CUDA Graph utilities.
+Only ordinary PyTorch tensor operations are used here; this module does not
+import TensorRT, Triton, or CUDA Graph utilities.
 """
 
 from __future__ import annotations
@@ -408,69 +405,8 @@ class PI05DenoiseStepExportWrapper(nn.Module):
         return x_t + increment.float()
 
 
-class GR00TVisionExportWrapper(nn.Module):
-    """Eagle SigLIP vision transformer with explicit position IDs.
-
-    The explicit-position-ID export interface follows the design described by
-    NVIDIA's N1.5 deployment, but this wrapper is independently implemented
-    against FluxVLA's vendored Eagle model object. See ``ATTRIBUTION.md``.
-    """
-
-    def __init__(self, eagle_backbone: nn.Module) -> None:
-        super().__init__()
-        self.vision = eagle_backbone.vlm.vision_model.vision_model
-        self.eval()
-
-    def forward(self, pixel_values: torch.Tensor,
-                position_ids: torch.Tensor) -> torch.Tensor:
-        embeddings = self.vision.embeddings
-        patch = embeddings.patch_embedding(
-            pixel_values.to(embeddings.patch_embedding.weight.dtype))
-        hidden = patch.flatten(2).transpose(1, 2)
-        hidden = hidden + embeddings.position_embedding(position_ids)
-        output = self.vision.encoder(
-            inputs_embeds=hidden,
-            output_attentions=False,
-            output_hidden_states=False,
-            return_dict=True)
-        return self.vision.post_layernorm(output.last_hidden_state)
-
-
-class GR00TLLMExportWrapper(nn.Module):
-    """Selected Eagle language layers and final feature projection."""
-
-    def __init__(self, eagle_backbone: nn.Module) -> None:
-        super().__init__()
-        self.language_model = eagle_backbone.vlm.language_model
-        self.eagle_linear = eagle_backbone.eagle_linear
-        self.select_layer = int(eagle_backbone.select_layer)
-        self.eval()
-
-    def forward(self, inputs_embeds: torch.Tensor,
-                attention_mask: torch.Tensor) -> torch.Tensor:
-        output = self.language_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-            return_dict=True)
-        return self.eagle_linear(output.hidden_states[self.select_layer])
-
-
-class GR00TBackboneOutputExportWrapper(nn.Module):
-    """VLLN and VL self-attention partition from the GR00T action head."""
-
-    def __init__(self, action_head: nn.Module) -> None:
-        super().__init__()
-        self.vlln = action_head.vlln
-        self.vl_self_attention = action_head.vl_self_attention
-        self.eval()
-
-    def forward(self, backbone_features: torch.Tensor) -> torch.Tensor:
-        return self.vl_self_attention(self.vlln(backbone_features))
-
-
-def finite_tensor(name: str, value: torch.Tensor) -> None:
-    """Raise a useful error when an exported/runtime result is non-finite."""
-    if not bool(torch.isfinite(value).all().item()):
-        raise RuntimeError(f'{name} contains NaN or Inf')
+__all__ = [
+    'PI05VisionExportWrapper',
+    'PI05PrefixExportWrapper',
+    'PI05DenoiseStepExportWrapper',
+]

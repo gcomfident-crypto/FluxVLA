@@ -1,155 +1,103 @@
-# FluxVLA TensorRT Deployment
+# TensorRT Deployment
 
-This directory provides TensorRT inference for PI0.5 and GR00T-N1.5 in
-FluxVLA.
+TensorRT inference for FluxVLA PI0.5 and GR00T-N1.5:
 
 ```text
-checkpoint -> ONNX -> TensorRT engine -> FluxVLA inference
+checkpoint -> ONNX partitions -> TensorRT plans -> FluxVLA evaluation
 ```
 
-- PI0.5: 3 engines for Vision, Prefix and Denoise (V/P/D).
-- GR00T-N1.5: 7 engines for ViT, LLM and the action head.
-- The original PyTorch configs remain available.
+- PI0.5: Vision, Prefix, and Denoise plans.
+- GR00T-N1.5: ViT, LLM, backbone processor, state encoder, action encoder,
+  DiT, and action decoder plans.
+- The TensorRT path does not use Triton kernels or CUDA Graph.
+- The original eager PyTorch path remains selectable.
 
-This root-level directory contains deployment commands and ONNX export
-wrappers. Reusable contracts, checkpoint validation and engine execution live
-under `fluxvla/deployment/tensorrt`, so the runtime is included in installed
-FluxVLA packages while these scripts remain standalone deployment tools.
-The GR00T partitioning reference and implementation provenance are documented
-in [ATTRIBUTION.md](ATTRIBUTION.md).
+The GR00T partition follows the
+[Isaac-GR00T N1.5 deployment design](https://github.com/NVIDIA/Isaac-GR00T/blob/n1.5-release/deployment_scripts/README.md).
+Run every command below from the FluxVLA source root.
 
-All commands in this guide must be run from the root of a FluxVLA source
-checkout. The `deployment_scripts/`, `configs/`, this guide, and
-`requirements-tensorrt.txt` are source-tree deployment tools and are not
-included in an installed FluxVLA wheel.
+## 1. Environment
 
-## 1. Installation
-
-Install FluxVLA first, then install the optional TensorRT dependencies:
+Install FluxVLA first, then the optional deployment packages:
 
 ```bash
 python -m pip install -r requirements-tensorrt.txt
+python -c "import onnx, tensorrt; print(onnx.__version__, tensorrt.__version__)"
 ```
 
-If only an installed FluxVLA wheel is available, install the runtime
-dependencies directly:
+The reusable runtime under `fluxvla/deployment/tensorrt` is included in the
+FluxVLA package. The CLI scripts, configs, and this guide are source-tree
+tools, so export, build, smoke, parity, and benchmark commands require a
+FluxVLA source checkout.
+
+The pip requirements do not install `trtexec`. Install the matching full
+TensorRT SDK separately. The Python bindings and `trtexec` must have the same
+`major.minor.patch` version.
 
 ```bash
-python -m pip install \
-  --extra-index-url https://pypi.nvidia.com \
-  onnx==1.18.0 \
-  tensorrt-cu12==11.1.0.106 \
-  tensorrt-cu12-bindings==11.1.0.106 \
-  tensorrt-cu12-libs==11.1.0.106
-```
-
-Exporting ONNX, building engines, and running the supplied smoke command still
-require a source checkout because their modules, configs, and shell script are
-not installed by the wheel.
-
-`trtexec` and the TensorRT Python package must use the same
-`major.minor.patch` version. If `trtexec` is not in `PATH`, set
-`TRTEXEC=/absolute/path/to/trtexec` when building engines.
-
-The packages in `requirements-tensorrt.txt` install ONNX and the TensorRT
-Python runtime. They do **not** install the `trtexec` command-line tool.
-Install the matching full TensorRT SDK separately (for example, from an
-NVIDIA tar or Debian package), then verify both components before exporting or
-building:
-
-```bash
-python -c "import tensorrt as trt; print(trt.__version__)"
+trtexec --version
+# If it is not in PATH:
 export TRTEXEC=/absolute/path/to/trtexec
-"${TRTEXEC}" --version
 ```
 
-### Current support scope
+### Supported profiles
 
-| Environment                                  | Status                                                       | Notes                                                                                                                                                                                                            |
-| -------------------------------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Linux x86_64, CUDA 12, TensorRT 11.1         | Supported reference environment                              | `requirements-tensorrt.txt` targets this environment. Use an NVIDIA driver compatible with the installed CUDA/TensorRT stack.                                                                                    |
-| NVIDIA RTX 3090                              | Validated                                                    | Both PI0.5 and GR00T-N1.5 real-engine smoke and numerical-parity checks have passed.                                                                                                                             |
-| Other x86_64 RTX, A-series, or H-series GPUs | Not yet validated                                            | Re-export or reuse the ONNX files, but rebuild every TensorRT engine on the target system and rerun smoke, numerical-parity, and task evaluation.                                                                |
-| Linux aarch64, Jetson Orin, or Thor          | Not supported by the current pip requirements; not validated | The pinned TensorRT wheels used here are not the installation path for these platforms. A platform-provided TensorRT/JetPack stack, matching build tools, code validation, and newly built engines are required. |
-| Windows                                      | Not supported or validated                                   | The scripts and environment instructions currently target Linux.                                                                                                                                                 |
-| CPU-only or non-NVIDIA GPU systems           | Not supported                                                | TensorRT execution requires a supported NVIDIA CUDA GPU.                                                                                                                                                         |
+| Model      | Precision                                                          | Static profile                                                                    |
+| ---------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------- |
+| PI0.5      | BF16 learned-network tensors; FP32 flow state and returned actions | Batch 1, two 224x224 views, 180 language tokens, horizon 10, 10 Euler steps       |
+| GR00T-N1.5 | FP16 neural I/O, FP32 returned actions                             | Batch 1, two 224x224 views, sequence length 600, horizon 10, four denoising steps |
 
-TensorRT plans are not treated as portable artifacts in this implementation.
-Do not copy an engine built for one GPU or TensorRT version to another target.
-The runtime checks the TensorRT `major.minor.patch` identity, and the build does
-not enable TensorRT hardware-compatibility or version-compatible plan modes.
-Build the plans again on each target environment.
+The reference installation is Linux x86_64, CUDA 12, and TensorRT 11.1. RTX
+3090 has passed real-plan smoke and numerical-parity checks. Other RTX,
+A-series, and H-series GPUs require rebuilding and revalidation. The current
+pip requirements do not support aarch64 Jetson Orin or Thor; those platforms
+need their platform TensorRT/JetPack stack and have not been validated here.
 
-The currently supported model profiles are also static:
-
-| Model      | Precision                              | Supported input profile                                                                          |
-| ---------- | -------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| PI0.5      | BF16 neural I/O, FP32 actions          | Batch 1, two 224x224 image views, 180 language tokens, action horizon 10, exactly 10 Euler steps |
-| GR00T-N1.5 | FP16 neural I/O, FP32 returned actions | Batch 1, two 224x224 image views, sequence length 600, action horizon 10, four denoising steps   |
-
-All seven GR00T-N1.5 ONNX graphs and TensorRT engines use these static shapes;
-the build does not create dynamic TensorRT optimization profiles.
-
-Different image counts (for example, three cameras), batch sizes, sequence
-lengths, precisions, action shapes, or denoising schedules are outside the
-current runtime contract. Supporting them requires updating the contract,
-re-exporting ONNX, rebuilding the engines, and repeating correctness and task
-validation.
+TensorRT plans are not treated as portable. Rebuild them after changing the
+GPU architecture or TensorRT version. Supporting a different camera count,
+batch, sequence length, action shape, or solver schedule requires changing the
+contract, exporting ONNX again, rebuilding plans, and repeating validation.
 
 ## 2. Export ONNX
 
-PI0.5:
-
 ```bash
+# PI0.5
 python -m deployment_scripts.tensorrt.export_onnx pi05 \
   --config configs/pi05/pi05_paligemma_libero_10_full_finetune.py \
   --checkpoint checkpoints/pi05_paligemma_libero_10_full_finetune_bs64/checkpoints/step-038064-epoch-24-loss=0.0170.safetensors
-```
 
-GR00T-N1.5:
-
-```bash
+# GR00T-N1.5
 python -m deployment_scripts.tensorrt.export_onnx groot-n15 \
   --config configs/gr00t/gr00t_eagle_3b_libero_10_full_finetune.py \
   --checkpoint checkpoints/gr00t_eagle_3b_libero_10_full_finetune_bs64/checkpoints/step-028548-epoch-18-loss=0.0546.safetensors \
   --sequence-length 600
 ```
 
-The default output directories are:
+The default outputs are `deployment_artifacts/onnx/pi05` and
+`deployment_artifacts/onnx/groot_n15`. Each complete export is published as a
+directory and contains `export_manifest.json`, graph hashes, static shapes,
+and checkpoint identity.
 
-```text
-deployment_artifacts/onnx/pi05
-deployment_artifacts/onnx/groot_n15
-```
-
-Each directory contains the exported ONNX graphs and
-`export_manifest.json`. Run the following command for optional export
-arguments:
+## 3. Build Plans
 
 ```bash
-python -m deployment_scripts.tensorrt.export_onnx --help
-```
-
-## 3. Build TensorRT Engines
-
-```bash
-# PI0.5
-bash deployment_scripts/tensorrt/build_engine.sh \
+CUDA_VISIBLE_DEVICES=3 bash deployment_scripts/tensorrt/build_engine.sh \
   pi05 deployment_artifacts/onnx/pi05 deployment_artifacts/engines/pi05
 
-# GR00T-N1.5
-bash deployment_scripts/tensorrt/build_engine.sh \
+CUDA_VISIBLE_DEVICES=3 bash deployment_scripts/tensorrt/build_engine.sh \
   groot-n15 deployment_artifacts/onnx/groot_n15 \
   deployment_artifacts/engines/groot_n15
 ```
 
-The script generates TensorRT engines, build logs, a timing cache and
-`engine_manifest.json`. The manifests record the checkpoint, model contract,
-TensorRT version and artifact hashes; inference rejects mismatched files.
+The build writes verbose TensorRT logs, a timing cache, plan hashes, and
+`engine_manifest.json`. Runtime loading fails if the plan bundle, checkpoint,
+TensorRT version, or static contract does not match.
+Use the physical target GPU when building; the commands above select GPU3 for
+the formal experiment in this document.
 
-## 4. Run Inference
+## 4. Validate
 
-Run one functional smoke inference with each real engine bundle:
+Run one real-plan inference for each model:
 
 ```bash
 python -m deployment_scripts.tensorrt.smoke_test pi05 \
@@ -161,11 +109,8 @@ python -m deployment_scripts.tensorrt.smoke_test groot-n15 \
   --checkpoint checkpoints/gr00t_eagle_3b_libero_10_full_finetune_bs64/checkpoints/step-028548-epoch-18-loss=0.0546.safetensors
 ```
 
-The smoke command checks output shape, dtype and finite values. It is not a
-latency benchmark or a task-success evaluation.
-
-Run deterministic numerical parity checks against both the native PyTorch
-model and the ONNX export wrappers:
+Compare native PyTorch, the ONNX export wrapper, and TensorRT with identical
+synthetic inputs and explicit noise:
 
 ```bash
 python -m deployment_scripts.tensorrt.parity_check pi05 \
@@ -177,42 +122,68 @@ python -m deployment_scripts.tensorrt.parity_check groot-n15 \
   --checkpoint checkpoints/gr00t_eagle_3b_libero_10_full_finetune_bs64/checkpoints/step-028548-epoch-18-loss=0.0546.safetensors
 ```
 
-The parity command uses fixed synthetic inputs and noise, reports maximum
-absolute error, RMSE and cosine similarity for all three implementation pairs,
-and exits with a non-zero status if a configured tolerance is exceeded. It is
-a numerical regression check rather than a LIBERO task-success evaluation.
+## 5. LIBERO-10 Benchmark
 
-For LIBERO evaluation, select the TensorRT config instead of the original
-PyTorch config:
+The formal protocol uses one GPU, all 10 LIBERO-10 tasks, 50 trials per task,
+five model-only warm-up calls, no rollout videos, and a deterministic changing
+noise seed (`7 + episode-local model-call index`). Simulator stepping is not
+part of the latency metric.
 
-```text
-PI0.5 PyTorch:   configs/pi05/pi05_paligemma_libero_10_full_finetune.py
-PI0.5 TensorRT:  configs/pi05/pi05_paligemma_libero_10_tensorrt.py
-GR00T PyTorch:   configs/gr00t/gr00t_eagle_3b_libero_10_full_finetune.py
-GR00T TensorRT:  configs/gr00t/gr00t_eagle_3b_libero_10_tensorrt.py
+| Run                      | Config                                                   | Comparison role                      |
+| ------------------------ | -------------------------------------------------------- | ------------------------------------ |
+| PI0.5 PyTorch BF16       | `configs/pi05/pi05_paligemma_libero_10_pytorch.py`       | PI0.5 speed and quality baseline     |
+| PI0.5 TensorRT BF16      | `configs/pi05/pi05_paligemma_libero_10_tensorrt.py`      | PI0.5 TensorRT                       |
+| GR00T-N1.5 PyTorch BF16  | `configs/gr00t/gr00t_eagle_3b_libero_10_pytorch.py`      | Original-precision quality reference |
+| GR00T-N1.5 PyTorch FP16  | `configs/gr00t/gr00t_eagle_3b_libero_10_pytorch_fp16.py` | Fair GR00T speed denominator         |
+| GR00T-N1.5 TensorRT FP16 | `configs/gr00t/gr00t_eagle_3b_libero_10_tensorrt.py`     | GR00T TensorRT                       |
+
+The supplied runner executes all five rows with the exact paired settings,
+keeps their raw artifacts in separate directories, and invokes the strict
+summarizer only after every run completes:
+
+```bash
+bash deployment_scripts/tensorrt/run_libero_benchmark.sh \
+  3 benchmark_results/pi05_gr00t_tensorrt_gpu3
 ```
 
-Use the selected config with the normal FluxVLA `scripts/eval.py` command.
-Engine paths can be overridden through `--cfg-options`.
+The first argument is the physical GPU index and the second is a new output
+directory. The script records `CUDA_VISIBLE_DEVICES`, `nvidia-smi`, the Git
+state, Python packages, all console logs, and the resolved directory of every
+run. Set `PI05_CHECKPOINT` or `GROOT_CHECKPOINT` only when the checkpoints are
+stored outside the documented default paths.
 
-## 5. Engine Partitions
+Every run writes `time_profile/inference_calls.csv`. Its principal fields are:
 
-| Model      | Engines                                                                                                           |
-| ---------- | ----------------------------------------------------------------------------------------------------------------- |
-| PI0.5      | `vision`, `prefix`, `denoise`                                                                                     |
-| GR00T-N1.5 | `vit_fp16`, `llm_fp16`, `vlln_vl_self_attention`, `state_encoder`, `action_encoder`, `dit_fp16`, `action_decoder` |
+- `inference_ms`: synchronized `predict_action` time.
+- `pipeline_total_ms`: preprocessing + inference + output transfer + action
+  denormalization.
+- module fields: CUDA-event attribution for PI0.5 V/P/D or GR00T backbone and
+  action-head partitions.
+- `initial_state_sha256` and `inference_seed`: pairing evidence.
 
-PI0.5 executes Vision once, Prefix once and Denoise ten times per action
-prediction. GR00T retains lightweight PyTorch glue operations such as token
-embedding, image-token splicing, tensor concatenation and Euler updates; the
-neural modules represented by the seven engines run through TensorRT.
+Module attribution records CUDA Events and therefore adds a small, symmetric
+profiling overhead to `inference_ms`. The official plan-only numbers below are
+measured separately by `trtexec` without these events.
 
-## 6. Notes
+The GR00T speedup is calculated from PyTorch FP16 versus TensorRT FP16. PyTorch
+BF16 is kept as a separate quality reference; comparing BF16 directly with
+FP16 would mix backend and precision effects.
 
-- Inference currently uses batch size 1 and manifest-defined input shapes.
-- PI0.5 keeps action horizon 10 and exactly 10 Euler steps.
-- TensorRT configs fail on missing or incompatible engines; they do not
-  silently fall back to the PyTorch neural path.
-- TensorRT plans should be rebuilt for the target GPU and TensorRT version.
-- Performance profiling, quantization and cross-GPU validation are outside the
-  current implementation scope.
+### Official plan benchmark
+
+Use `trtexec` to measure the serialized plans without H2D/D2H or CUDA Graph:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 bash deployment_scripts/tensorrt/benchmark_engines.sh \
+  pi05 deployment_artifacts/engines/pi05 benchmark_results/trtexec/pi05
+
+CUDA_VISIBLE_DEVICES=3 bash deployment_scripts/tensorrt/benchmark_engines.sh \
+  groot-n15 deployment_artifacts/engines/groot_n15 \
+  benchmark_results/trtexec/groot_n15
+```
+
+## 6. Performance
+
+The previous GR00T result was removed because PyTorch did not receive the same
+seed control and used BF16 while TensorRT used FP16. This section will be
+populated only from the corrected five-run GPU3 experiment described above.

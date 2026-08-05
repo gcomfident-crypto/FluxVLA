@@ -7,6 +7,7 @@
 *.tiff
 *.svg
 *.webp
+!deployment_scripts/tensorrt/assets/*.png
 
 # Keep the real-robot demo used by the READMEs
 !/docs/fluxvla-real-robot-demo-compressed.gif
@@ -93,3 +94,6 @@ wheels/
 
 # Local change log kept out of git
 /lessons.md
+
+# Ignore local TensorRT / LIBERO benchmark run outputs
+benchmark_results/

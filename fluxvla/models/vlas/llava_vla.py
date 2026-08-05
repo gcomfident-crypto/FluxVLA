@@ -258,3 +258,25 @@ class LlavaVLA(BaseVLA):
             predict_kwargs['seed'] = seed
         pred_actions = self.vla_head.predict_action(**predict_kwargs)
         return pred_actions.float()
+
+    def configure_inference_profile(self, enabled: bool) -> None:
+        for component in (getattr(self, 'vlm_backbone',
+                                  None), getattr(self, 'vla_head', None)):
+            hook = getattr(component, 'configure_inference_profile', None)
+            if callable(hook):
+                hook(enabled)
+
+    def resolve_inference_profile(self):
+        merged = {}
+        for component in (getattr(self, 'vlm_backbone',
+                                  None), getattr(self, 'vla_head', None)):
+            hook = getattr(component, 'resolve_inference_profile', None)
+            if not callable(hook):
+                continue
+            values = hook()
+            duplicates = set(merged).intersection(values)
+            if duplicates:
+                raise RuntimeError(
+                    f'Duplicate inference profile fields: {duplicates}')
+            merged.update(values)
+        return merged
