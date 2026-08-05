@@ -191,6 +191,7 @@ def _validate_protocol(key: str, path: Path, summary: dict, environment: dict,
         raise ValueError(f'{key}: expected CUDA_VISIBLE_DEVICES='
                          f'{visible_device}')
     required_environment = {
+        'cuda_device_order': 'PCI_BUS_ID',
         'rank': 0,
         'world_size': 1,
         'logical_cuda_device': 0,

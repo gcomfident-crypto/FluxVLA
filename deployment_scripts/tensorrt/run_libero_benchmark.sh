@@ -17,6 +17,11 @@
 
 set -euo pipefail
 
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+project_root=$(cd "${script_dir}/../.." && pwd)
+project_pythonpath="${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
+cd "${project_root}"
+
 benchmark_gpu=${1:-3}
 benchmark_root=${2:-benchmark_results/tensorrt_gpu3_$(date +%Y%m%d_%H%M%S)}
 
@@ -33,6 +38,28 @@ for checkpoint in "${pi05_checkpoint}" "${groot_checkpoint}"; do
 done
 
 mkdir -p "${benchmark_root}/environment"
+PYTHONPATH="${project_pythonpath}" python - "${project_root}" \
+    >"${benchmark_root}/environment/import_identity.txt" <<'PY'
+import importlib
+import pathlib
+import sys
+
+project_root = pathlib.Path(sys.argv[1]).resolve()
+for module_name in (
+        'fluxvla',
+        'fluxvla.engines.runners.libero_eval_runner',
+        'fluxvla.models.vlas.llava_tensorrt',
+):
+    module = importlib.import_module(module_name)
+    module_path = pathlib.Path(module.__file__).resolve()
+    try:
+        module_path.relative_to(project_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            f'{module_name} resolved outside this checkout: {module_path}') \
+            from exc
+    print(f'{module_name}={module_path}')
+PY
 for bundle in pi05 groot_n15; do
     if [[ "${bundle}" == "pi05" ]]; then
         engine_dir=${pi05_engine_dir}
@@ -66,10 +93,14 @@ run_group() {
     local output="${benchmark_root}/${key}"
 
     mkdir -p "${output}"
+    CUDA_DEVICE_ORDER=PCI_BUS_ID \
     CUDA_VISIBLE_DEVICES="${benchmark_gpu}" \
     MUJOCO_GL=egl \
     WANDB_MODE=disabled \
     TOKENIZERS_PARALLELISM=false \
+    OMP_NUM_THREADS=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH="${project_pythonpath}" \
     torchrun --standalone --nnodes 1 --nproc-per-node 1 scripts/eval.py \
         --config "${config}" \
         --ckpt-path "${checkpoint}" \
