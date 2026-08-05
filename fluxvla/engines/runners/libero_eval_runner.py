@@ -688,6 +688,8 @@ class LiberoEvalRunner(BaseEvalRunner):
                 1,
                 'cuda_visible_devices':
                 os.environ.get('CUDA_VISIBLE_DEVICES', ''),
+                'cuda_device_order':
+                os.environ.get('CUDA_DEVICE_ORDER', ''),
                 'rank':
                 rank,
                 'world_size':

@@ -81,10 +81,12 @@ and checkpoint identity.
 ## 3. Build Plans
 
 ```bash
-CUDA_VISIBLE_DEVICES=3 bash deployment_scripts/tensorrt/build_engine.sh \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
+  bash deployment_scripts/tensorrt/build_engine.sh \
   pi05 deployment_artifacts/onnx/pi05 deployment_artifacts/engines/pi05
 
-CUDA_VISIBLE_DEVICES=3 bash deployment_scripts/tensorrt/build_engine.sh \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
+  bash deployment_scripts/tensorrt/build_engine.sh \
   groot-n15 deployment_artifacts/onnx/groot_n15 \
   deployment_artifacts/engines/groot_n15
 ```
@@ -174,10 +176,12 @@ FP16 would mix backend and precision effects.
 Use `trtexec` to measure the serialized plans without H2D/D2H or CUDA Graph:
 
 ```bash
-CUDA_VISIBLE_DEVICES=3 bash deployment_scripts/tensorrt/benchmark_engines.sh \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
+  bash deployment_scripts/tensorrt/benchmark_engines.sh \
   pi05 deployment_artifacts/engines/pi05 benchmark_results/trtexec/pi05
 
-CUDA_VISIBLE_DEVICES=3 bash deployment_scripts/tensorrt/benchmark_engines.sh \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
+  bash deployment_scripts/tensorrt/benchmark_engines.sh \
   groot-n15 deployment_artifacts/engines/groot_n15 \
   benchmark_results/trtexec/groot_n15
 ```
