@@ -24,6 +24,14 @@ from transformers.cache_utils import Cache
 from fluxvla.engines import (VLAS, build_llm_backbone_from_cfg,
                              build_projector_from_cfg)
 from fluxvla.engines.losses import reduce_action_bc_loss
+# yapf: disable
+from fluxvla.engines.utils.inference_profile import (begin_module_profile,
+                                                     configure_module_profile,
+                                                     module_stage,
+                                                     resolve_module_profile,
+                                                     start_module_stage,
+                                                     stop_module_stage)
+# yapf: enable
 from fluxvla.engines.utils.model_utils import (apply_rotary_pos_emb,
                                                create_sinusoidal_pos_embedding,
                                                eager_attention_forward,
@@ -175,13 +183,14 @@ class PI0FlowMatching(BaseVLA):
                    for selector in self.params_to_change_dtype):
                 param.data = param.data.to(dtype=torch.bfloat16)
 
-    def sample_noise(self, shape, device):
+    def sample_noise(self, shape, device, generator=None):
         noise = torch.normal(
             mean=0.0,
             std=1.0,
             size=shape,
             dtype=torch.float32,
             device=device,
+            generator=generator,
         )
         return noise
 
@@ -219,7 +228,9 @@ class PI0FlowMatching(BaseVLA):
         pad_masks = list()
         attn_masks = list()
         img_masks = img_masks.permute(1, 0)
-        img_emb = self.projector(self.vision_backbone(images))
+        with module_stage(self, 'vision'):
+            img_emb = self.projector(self.vision_backbone(images))
+        start_module_stage(self, 'prefix')
         embs.append(img_emb)
         bsize, num_img_embs = img_emb.shape[:2]
         for img_mask in img_masks:
@@ -650,8 +661,9 @@ class PI0FlowMatching(BaseVLA):
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
             t_batch = time.expand(bsize)
-            v_t = denoise(x_t, t_batch)
-            x_t += dt * v_t
+            with module_stage(self, 'denoise_step'):
+                v_t = denoise(x_t, t_batch)
+                x_t += dt * v_t
             time += dt
         return x_t
 
@@ -720,11 +732,35 @@ class PI0FlowMatching(BaseVLA):
                        rtc_config: dict = None,
                        *args,
                        **kwargs):
+        begin_module_profile(self)
         device = states.device
         bsize = states.shape[0]
+        requested_steps = kwargs.get('num_inference_steps')
+        if (requested_steps is not None
+                and int(requested_steps) != self.num_steps):
+            raise ValueError('PI0.5 PyTorch uses a fixed number of Euler '
+                             'steps')
+        external_noise = noise is not None
         if noise is None:
             actions_shape = (bsize, self.n_action_steps, self.max_action_dim)
-            noise = self.sample_noise(actions_shape, device)
+            generator = None
+            seed = kwargs.get('seed')
+            if seed is not None:
+                if type(seed) is not int or seed < 0:
+                    raise ValueError('seed must be a non-negative integer')
+                generator = torch.Generator(device=device)
+                generator.manual_seed(seed)
+            noise = self.sample_noise(
+                actions_shape, device, generator=generator)
+        else:
+            expected_noise_shape = (bsize, self.n_action_steps,
+                                    self.max_action_dim)
+            if tuple(noise.shape) != expected_noise_shape:
+                raise ValueError(f'noise shape must be {expected_noise_shape}')
+            if noise.device != device:
+                raise ValueError('noise must share the input CUDA device')
+            if noise.dtype != torch.float32:
+                raise TypeError('PI0.5 noise must be FP32')
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images=images,
@@ -747,6 +783,7 @@ class PI0FlowMatching(BaseVLA):
             position_ids=position_ids,
             use_cache=True,
             past_key_values=None)
+        stop_module_stage(self, 'prefix')
 
         dt = -1.0 / self.num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -760,36 +797,50 @@ class PI0FlowMatching(BaseVLA):
         if prev_actions is not None and prefix_len > 0 and rtc_config:
             rtc_method = rtc_config.get('method', 'prefix')
 
-        x_t = noise
+        # The solver updates x_t in place. Do not mutate an explicit tensor
+        # owned by the caller (parity checks and downstream integrations may
+        # reuse it); internally generated noise keeps the original hot path.
+        x_t = noise.clone() if external_noise else noise
 
         def denoise(x, t):
             return self.denoise_step(states, prefix_pad_masks, past_key_values,
                                      x, t)
 
-        if rtc_method == 'prefix':
-            x_t = self._predict_action_prefix_rtc(
-                x_t=x_t,
-                denoise=denoise,
-                bsize=bsize,
-                dt=dt,
-                device=device,
-                prev_actions=prev_actions,
-                prefix_len=prefix_len)
-        elif rtc_method == 'guidance':
-            x_t = self._predict_action_guidance_rtc(
-                x_t=x_t,
-                denoise=denoise,
-                bsize=bsize,
-                dt=dt,
-                device=device,
-                prev_actions=prev_actions,
-                prefix_len=prefix_len,
-                rtc_config=rtc_config)
-        else:
-            x_t = self._predict_action_plain(
-                x_t=x_t, denoise=denoise, bsize=bsize, dt=dt, device=device)
+        with module_stage(self, 'denoise'):
+            if rtc_method == 'prefix':
+                x_t = self._predict_action_prefix_rtc(
+                    x_t=x_t,
+                    denoise=denoise,
+                    bsize=bsize,
+                    dt=dt,
+                    device=device,
+                    prev_actions=prev_actions,
+                    prefix_len=prefix_len)
+            elif rtc_method == 'guidance':
+                x_t = self._predict_action_guidance_rtc(
+                    x_t=x_t,
+                    denoise=denoise,
+                    bsize=bsize,
+                    dt=dt,
+                    device=device,
+                    prev_actions=prev_actions,
+                    prefix_len=prefix_len,
+                    rtc_config=rtc_config)
+            else:
+                x_t = self._predict_action_plain(
+                    x_t=x_t,
+                    denoise=denoise,
+                    bsize=bsize,
+                    dt=dt,
+                    device=device)
 
         return x_t
+
+    def configure_inference_profile(self, enabled: bool) -> None:
+        configure_module_profile(self, enabled)
+
+    def resolve_inference_profile(self):
+        return resolve_module_profile(self)
 
     def denoise_step(
         self,

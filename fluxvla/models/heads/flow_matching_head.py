@@ -23,6 +23,10 @@ from torch.distributions import Beta
 
 from fluxvla.engines import HEADS
 from fluxvla.engines.losses import reduce_action_bc_loss
+from fluxvla.engines.utils.inference_profile import (begin_module_profile,
+                                                     configure_module_profile,
+                                                     module_stage,
+                                                     resolve_module_profile)
 from fluxvla.models.blocks import SelfAttentionTransformer
 from fluxvla.models.blocks.cross_attention_dit import DiT
 
@@ -194,6 +198,10 @@ class FlowMatchingHead(nn.Module):
         num_steps: The number of steps.
         diffusion_model_cfg: The configuration for the diffusion model.
     """
+
+    supports_predict_action_controls = True
+    predict_action_control_names = frozenset(
+        ('noise', 'seed', 'num_inference_steps'))
 
     def __init__(self,
                  hidden_size: int,
@@ -382,7 +390,9 @@ class FlowMatchingHead(nn.Module):
             Predicted velocity (B, T, D).
         """
         t_enc = t_encoder if t_encoder is not None else t_global
-        action_features = self.action_encoder(actions, t_enc, embodiment_ids)
+        with module_stage(self, 'action_encoder'):
+            action_features = self.action_encoder(actions, t_enc,
+                                                  embodiment_ids)
         if self.add_positional_embeddings:
             pos_ids = torch.arange(
                 action_features.shape[1],
@@ -396,13 +406,15 @@ class FlowMatchingHead(nn.Module):
         sa_embs = torch.cat((state_features, future_tokens, action_features),
                             dim=1)
 
-        model_output = self.model(
-            hidden_states=sa_embs,
-            encoder_hidden_states=input_features,
-            encoder_attention_mask=attention_mask,
-            timestep=t_global,
-        )
-        pred = self.action_decoder(model_output, embodiment_ids)
+        with module_stage(self, 'dit'):
+            model_output = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=input_features,
+                encoder_attention_mask=attention_mask,
+                timestep=t_global,
+            )
+        with module_stage(self, 'action_decoder'):
+            pred = self.action_decoder(model_output, embodiment_ids)
         return pred[:, -self.num_steps:]
 
     def _predict_action_plain(self, actions, denoise, batch_size, device, dt):
@@ -476,18 +488,50 @@ class FlowMatchingHead(nn.Module):
                        embodiment_ids: torch.Tensor,
                        prev_actions=None,
                        prefix_len: int = 0,
-                       rtc_config: dict = None):
+                       rtc_config: dict = None,
+                       noise: torch.Tensor = None,
+                       seed: int = None,
+                       num_inference_steps: int = None):
+        begin_module_profile(self)
+        if (num_inference_steps is not None
+                and int(num_inference_steps) != self.num_inference_timesteps):
+            raise ValueError('GR00T-N1.5 PyTorch uses a fixed number of '
+                             'denoising steps')
         device = input_features.device
-        input_features = self.vlln(input_features)
-        input_features = self.vl_self_attention(input_features)
+        with module_stage(self, 'backbone_processor'):
+            input_features = self.vlln(input_features)
+            input_features = self.vl_self_attention(input_features)
         batch_size = input_features.shape[0]
-        state_features = self.state_encoder(
-            states.unsqueeze(1), embodiment_ids)
-        actions = torch.randn(
-            size=(batch_size, self.num_steps, self.action_dim),
-            dtype=input_features.dtype,
-            device=input_features.device,
-        )
+        with module_stage(self, 'state_encoder'):
+            state_features = self.state_encoder(
+                states.unsqueeze(1), embodiment_ids)
+        expected_noise_shape = (batch_size, self.num_steps, self.action_dim)
+        if noise is None:
+            if seed is None:
+                # Preserve the original unseeded PyTorch behavior.
+                actions = torch.randn(
+                    size=expected_noise_shape,
+                    dtype=input_features.dtype,
+                    device=device)
+            else:
+                if type(seed) is not int or seed < 0:
+                    raise ValueError('seed must be a non-negative integer')
+                generator = torch.Generator(device=device)
+                generator.manual_seed(seed)
+                # Generate the benchmark latent in FP32 before casting so
+                # BF16 PyTorch, FP16 PyTorch, and FP16 TensorRT receive the
+                # same underlying random values.
+                actions = torch.randn(
+                    size=expected_noise_shape,
+                    dtype=torch.float32,
+                    device=device,
+                    generator=generator).to(input_features.dtype)
+        else:
+            if tuple(noise.shape) != expected_noise_shape:
+                raise ValueError(f'noise shape must be {expected_noise_shape}')
+            if noise.device != device:
+                raise ValueError('noise must share the input CUDA device')
+            actions = noise.to(dtype=input_features.dtype)
         dt = 1.0 / self.num_inference_timesteps
 
         if (prev_actions is not None and self.ori_action_dim is not None
@@ -504,36 +548,43 @@ class FlowMatchingHead(nn.Module):
                                      attention_mask, embodiment_ids, t_global,
                                      t_encoder)
 
-        if rtc_method == 'prefix':
-            actions = self._predict_action_prefix_rtc(
-                actions=actions,
-                denoise=denoise,
-                batch_size=batch_size,
-                device=device,
-                dt=dt,
-                prev_actions=prev_actions,
-                prefix_len=prefix_len)
-        elif rtc_method == 'guidance':
-            actions = self._predict_action_guidance_rtc(
-                actions=actions,
-                denoise=denoise,
-                batch_size=batch_size,
-                device=device,
-                dt=dt,
-                prev_actions=prev_actions,
-                prefix_len=prefix_len,
-                rtc_config=rtc_config)
-        else:
-            actions = self._predict_action_plain(
-                actions=actions,
-                denoise=denoise,
-                batch_size=batch_size,
-                device=device,
-                dt=dt)
+        with module_stage(self, 'action_expert'):
+            if rtc_method == 'prefix':
+                actions = self._predict_action_prefix_rtc(
+                    actions=actions,
+                    denoise=denoise,
+                    batch_size=batch_size,
+                    device=device,
+                    dt=dt,
+                    prev_actions=prev_actions,
+                    prefix_len=prefix_len)
+            elif rtc_method == 'guidance':
+                actions = self._predict_action_guidance_rtc(
+                    actions=actions,
+                    denoise=denoise,
+                    batch_size=batch_size,
+                    device=device,
+                    dt=dt,
+                    prev_actions=prev_actions,
+                    prefix_len=prefix_len,
+                    rtc_config=rtc_config)
+            else:
+                actions = self._predict_action_plain(
+                    actions=actions,
+                    denoise=denoise,
+                    batch_size=batch_size,
+                    device=device,
+                    dt=dt)
 
         if self.ori_action_dim is not None:
             actions = actions[:, :, :self.ori_action_dim]
         return actions
+
+    def configure_inference_profile(self, enabled: bool) -> None:
+        configure_module_profile(self, enabled)
+
+    def resolve_inference_profile(self):
+        return resolve_module_profile(self)
 
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)

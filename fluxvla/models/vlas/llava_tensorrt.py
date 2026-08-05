@@ -14,6 +14,7 @@
 """Root LlavaVLA adapter for checkpoint-safe TensorRT deployment."""
 
 from __future__ import annotations
+import threading
 from typing import Mapping
 
 import torch
@@ -27,7 +28,18 @@ from .llava_vla import LlavaVLA
 class LlavaTensorRT(LlavaVLA):
     """Apply the exporter's one-to-one checkpoint mapping before eval load."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # The backbone and head own separate TensorRT context groups. Hold one
+        # root transaction lock so concurrent callers cannot overwrite a
+        # persistent backbone output before the matching head consumes it.
+        self._tensorrt_predict_lock = threading.RLock()
+
     def prepare_eval_state_dict(
             self,
             state_dict: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return checkpoint_state_for_model(self, state_dict)
+
+    def predict_action(self, *args, **kwargs):
+        with self._tensorrt_predict_lock:
+            return super().predict_action(*args, **kwargs)

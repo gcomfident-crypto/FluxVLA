@@ -36,6 +36,11 @@ import copy
 import hashlib
 import inspect
 import json
+import os
+import shutil
+import tempfile
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -45,10 +50,10 @@ from mmengine import Config
 from fluxvla.deployment.tensorrt.checkpoint import checkpoint_state_for_model
 from fluxvla.deployment.tensorrt.pi05 import (PI05ExportContract,
                                               pi05_cache_names)
-from .model_forward import (GR00TBackboneOutputExportWrapper,
-                            GR00TLLMExportWrapper, GR00TVisionExportWrapper,
-                            PI05DenoiseStepExportWrapper,
-                            PI05PrefixExportWrapper, PI05VisionExportWrapper)
+from .groot_n15 import (GR00TBackboneOutputExportWrapper,
+                        GR00TLLMExportWrapper, GR00TVisionExportWrapper)
+from .pi05 import (PI05DenoiseStepExportWrapper, PI05PrefixExportWrapper,
+                   PI05VisionExportWrapper)
 
 
 def _sha256(path: Path) -> str:
@@ -97,6 +102,13 @@ def _construction_dtype_name(dtype: torch.dtype) -> str:
 
 def _load_model(config_path: Path, checkpoint: Path | None,
                 device: torch.device, dtype: torch.dtype):
+    if checkpoint is None:
+        raise ValueError(
+            '--checkpoint is required. Refusing to export a randomly '
+            'initialized TensorRT engine.')
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f'Checkpoint not found: {checkpoint}')
+
     # Importing fluxvla.models populates the registries.
     import fluxvla.models  # noqa: F401
     from fluxvla.engines import build_vla_from_cfg
@@ -116,12 +128,6 @@ def _load_model(config_path: Path, checkpoint: Path | None,
         # construction, rather than changing the config after tracing begins.
         vlm_backbone['attention_implementation'] = 'eager'
     model = build_vla_from_cfg(copy.deepcopy(cfg.model)).eval()
-    if checkpoint is None:
-        raise ValueError(
-            '--checkpoint is required. Refusing to export a randomly '
-            'initialized TensorRT engine.')
-    if not checkpoint.is_file():
-        raise FileNotFoundError(f'Checkpoint not found: {checkpoint}')
     state = checkpoint_state_for_model(model,
                                        _load_checkpoint_state(checkpoint))
     model.load_state_dict(state, strict=True)
@@ -215,7 +221,76 @@ def _write_manifest(output_dir: Path, value: dict) -> None:
     print(f'Export manifest: {path}')
 
 
+def _publish_output_dir(staging_dir: Path, output_dir: Path) -> None:
+    """Publish a complete export and preserve the old one on error."""
+    if not staging_dir.is_dir():
+        raise FileNotFoundError(f'Export staging directory is missing: '
+                                f'{staging_dir}')
+    if output_dir.is_symlink() or (output_dir.exists()
+                                   and not output_dir.is_dir()):
+        raise NotADirectoryError(
+            f'Export destination must be a real directory: {output_dir}')
+
+    backup_dir = None
+    if output_dir.exists():
+        backup_dir = output_dir.with_name(
+            f'.{output_dir.name}.backup-{uuid.uuid4().hex}')
+        os.replace(output_dir, backup_dir)
+
+    try:
+        os.replace(staging_dir, output_dir)
+    except BaseException as publish_error:
+        if backup_dir is not None and backup_dir.exists():
+            try:
+                os.replace(backup_dir, output_dir)
+            except BaseException as rollback_error:
+                raise RuntimeError(
+                    f'Failed to publish {staging_dir} ({publish_error!r}) and '
+                    f'restore the previous export from {backup_dir}') \
+                    from rollback_error
+        raise
+
+    if backup_dir is not None:
+        try:
+            shutil.rmtree(backup_dir)
+        except OSError as exc:
+            print(f'Warning: new export was published, but the old backup '
+                  f'could not be removed: {backup_dir}: {exc}')
+    print(f'Published complete export: {output_dir}')
+
+
+@contextmanager
+def _staged_output_dir(output_dir: Path):
+    """Yield a same-filesystem staging directory and publish it on success."""
+    output_dir = output_dir.expanduser()
+    if output_dir.is_symlink() or (output_dir.exists()
+                                   and not output_dir.is_dir()):
+        raise NotADirectoryError(
+            f'Export destination must be a real directory: {output_dir}')
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f'.{output_dir.name}.staging-',
+            dir=str(output_dir.parent),
+        ))
+    try:
+        yield staging_dir
+        _publish_output_dir(staging_dir, output_dir)
+    finally:
+        if staging_dir.exists():
+            try:
+                shutil.rmtree(staging_dir)
+            except OSError as exc:
+                print(f'Warning: export staging directory could not be '
+                      f'removed: {staging_dir}: {exc}')
+
+
 def export_pi05(args) -> None:
+    with _staged_output_dir(args.output_dir / 'pi05') as output_dir:
+        _export_pi05(args, output_dir)
+
+
+def _export_pi05(args, output_dir: Path) -> None:
     device = torch.device(args.device)
     contract = PI05ExportContract(
         image_views=args.image_views,
@@ -224,7 +299,6 @@ def export_pi05(args) -> None:
         action_dim=args.action_dim,
         denoise_steps=args.denoise_steps)
     model = _load_model(args.config, args.checkpoint, device, torch.bfloat16)
-    output_dir = args.output_dir / 'pi05'
 
     vision = PI05VisionExportWrapper(model, contract).to(device)
     images = torch.randn(
@@ -317,6 +391,11 @@ def _set_eager_attention(module: torch.nn.Module) -> None:
 
 
 def export_groot(args) -> None:
+    with _staged_output_dir(args.output_dir / 'groot_n15') as output_dir:
+        _export_groot(args, output_dir)
+
+
+def _export_groot(args, output_dir: Path) -> None:
     device = torch.device(args.device)
     model = _load_model(args.config, args.checkpoint, device, torch.float16)
     if not hasattr(model, 'vlm_backbone') or not hasattr(model, 'vla_head'):
@@ -339,7 +418,6 @@ def export_groot(args) -> None:
             f'--state-dim={args.state_dim} does not match the state encoder '
             f'({actual_state_dim})')
     _set_eager_attention(model)
-    output_dir = args.output_dir / 'groot_n15'
 
     vision = GR00TVisionExportWrapper(eagle).to(device)
     vision_config = eagle.vlm.vision_model.config
@@ -517,7 +595,10 @@ def parse_args():
     parser.add_argument('--state-dim', type=int, default=64)
     parser.add_argument('--action-horizon', type=int, default=10)
     parser.add_argument('--action-dim', type=int, default=32)
-    parser.add_argument('--denoise-steps', type=int, default=10)
+    parser.add_argument(
+        '--denoise-steps',
+        type=int,
+        help='PI0.5 Euler steps (fixed to 10); not used by GR00T-N1.5')
     return parser.parse_args()
 
 
@@ -530,8 +611,14 @@ def main() -> None:
     if not args.config.is_file():
         raise FileNotFoundError(f'Config not found: {args.config}')
     if args.model == 'pi05':
+        args.denoise_steps = (10 if args.denoise_steps is None else
+                              args.denoise_steps)
         export_pi05(args)
     else:
+        if args.denoise_steps is not None:
+            raise ValueError(
+                '--denoise-steps applies only to PI0.5; GR00T-N1.5 uses '
+                'the action-head value from its config')
         export_groot(args)
 
 

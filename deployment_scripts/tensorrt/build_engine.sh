@@ -135,7 +135,6 @@ build_engine() {
         --onnx="${onnx_path}" \
         --saveEngine="${ENGINE_DIR}/${name}.engine" \
         --stronglyTyped \
-        --noCudaGraph \
         --skipInference \
         --verbose \
         --profilingVerbosity=detailed \

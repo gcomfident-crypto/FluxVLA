@@ -105,6 +105,11 @@ class FlowMatchingInferenceHead(FlowMatchingHead):
         diffusion_model_cfg: The configuration for the diffusion model.
     """
 
+    # This CUDA-Graph implementation owns its random buffer and fixed graph
+    # schedule; it does not implement FlowMatchingHead's explicit inference
+    # controls.  Do not let LlavaVLA silently forward and then drop them.
+    supports_predict_action_controls = False
+
     def __init__(self,
                  hidden_size: int,
                  state_dim: int,

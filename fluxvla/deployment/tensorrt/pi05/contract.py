@@ -59,6 +59,10 @@ class PI05ExportContract:
                              f'{invalid}')
         if self.batch != 1:
             raise ValueError('PI0.5 TensorRT v1 supports batch size 1')
+        if self.action_horizon != 10 or self.denoise_steps != 10:
+            raise ValueError(
+                'PI0.5 TensorRT v1 requires action horizon 10 and exactly '
+                '10 Euler steps')
 
 
 def pi05_cache_names(contract: PI05ExportContract) -> tuple[str, ...]:
