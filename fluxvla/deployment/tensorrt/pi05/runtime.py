@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TensorRT-only PI0.5 V/P/D inference orchestration.
+"""TensorRT-backed PI0.5 V/P/D inference orchestration.
 
 The exported denoise partition includes one Euler update.  Consequently this
 runtime enqueues V once, P once, and D exactly ten times for every action

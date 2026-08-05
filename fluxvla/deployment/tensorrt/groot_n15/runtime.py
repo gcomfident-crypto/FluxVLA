@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TensorRT-only orchestration for the GR00T-N1.5 seven-engine split.
+"""TensorRT-backed orchestration for the GR00T-N1.5 seven-engine split.
 
 The two public runtime components deliberately mirror FluxVLA's model split:
 the Eagle backbone owns the ViT and LLM plans, while the flow-matching head

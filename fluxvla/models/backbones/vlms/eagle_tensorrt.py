@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TensorRT-only Eagle backbone for GR00T-N1.5 inference."""
+"""TensorRT-backed Eagle backbone for GR00T-N1.5 inference."""
 
 from __future__ import annotations
 import threading
@@ -142,8 +142,8 @@ class EagleTensorRTBackbone(EagleBackbone):
         # embedding/connector, release engine-covered modules, return their
         # cached allocations, and only then deserialize the plans.  This
         # avoids holding the full PyTorch backbone and TensorRT weights at the
-        # same time.  This adapter is TensorRT-only, so a failed deserialize is
-        # reported as unrecoverable rather than falling back to PyTorch.
+        # same time. This adapter has no PyTorch neural fallback, so a failed
+        # deserialize is reported as unrecoverable.
         self._embedding_layer = embedding_layer
         self._trt_release_started = True
         del self.vlm.vision_model
