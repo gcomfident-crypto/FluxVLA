@@ -9,11 +9,14 @@ checkpoint -> ONNX partitions -> TensorRT plans -> FluxVLA evaluation
 - PI0.5: Vision, Prefix, and Denoise plans.
 - GR00T-N1.5: ViT, LLM, backbone processor, state encoder, action encoder,
   DiT, and action decoder plans.
-- The TensorRT path does not use Triton kernels or CUDA Graph.
+- The TensorRT acceleration path does not invoke FluxVLA's Triton kernels or
+  enable CUDA Graph.
 - The original eager PyTorch path remains selectable.
 
-The GR00T partition follows the
+The GR00T partition boundaries and benchmark style follow the
 [Isaac-GR00T N1.5 deployment design](https://github.com/NVIDIA/Isaac-GR00T/blob/n1.5-release/deployment_scripts/README.md).
+This is FluxVLA's static deployment implementation, not NVIDIA's Thor FP8/FP4
+engine.
 Run every command below from the FluxVLA source root.
 
 ## 1. Environment
@@ -40,12 +43,21 @@ trtexec --version
 export TRTEXEC=/absolute/path/to/trtexec
 ```
 
+For an SDK `trtexec` used with pip-installed TensorRT libraries, expose the
+matching shared libraries before build or benchmark commands:
+
+```bash
+TRT_LIB_DIR=$(python -c \
+  'import pathlib, tensorrt_libs; print(pathlib.Path(tensorrt_libs.__file__).resolve().parent)')
+export LD_LIBRARY_PATH="${TRT_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+```
+
 ### Supported profiles
 
-| Model      | Precision                                                          | Static profile                                                                    |
-| ---------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------- |
-| PI0.5      | BF16 learned-network tensors; FP32 flow state and returned actions | Batch 1, two 224x224 views, 180 language tokens, horizon 10, 10 Euler steps       |
-| GR00T-N1.5 | FP16 neural I/O, FP32 returned actions                             | Batch 1, two 224x224 views, sequence length 600, horizon 10, four denoising steps |
+| Model      | Floating-point profile                                         | Static profile                                                                    |
+| ---------- | -------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| PI0.5      | BF16 main neural compute; FP32 flow state and returned actions | Batch 1, two 224x224 views, 180 language tokens, horizon 10, 10 Euler steps       |
+| GR00T-N1.5 | FP16 main neural compute; FP32 returned actions                | Batch 1, two 224x224 views, sequence length 600, horizon 10, four denoising steps |
 
 The reference installation is Linux x86_64, CUDA 12, and TensorRT 11.1. RTX
 3090 has passed real-plan smoke and numerical-parity checks. Other RTX,
@@ -57,17 +69,22 @@ TensorRT plans are not treated as portable. Rebuild them after changing the
 GPU architecture or TensorRT version. Supporting a different camera count,
 batch, sequence length, action shape, or solver schedule requires changing the
 contract, exporting ONNX again, rebuilding plans, and repeating validation.
+The examples below select physical GPU3 for the documented experiment. Replace
+`3` on another host; after masking, the process sees that card as logical
+`cuda:0`.
 
 ## 2. Export ONNX
 
 ```bash
 # PI0.5
-python -m deployment_scripts.tensorrt.export_onnx pi05 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
+  python -m deployment_scripts.tensorrt.export_onnx pi05 \
   --config configs/pi05/pi05_paligemma_libero_10_full_finetune.py \
   --checkpoint checkpoints/pi05_paligemma_libero_10_full_finetune_bs64/checkpoints/step-038064-epoch-24-loss=0.0170.safetensors
 
 # GR00T-N1.5
-python -m deployment_scripts.tensorrt.export_onnx groot-n15 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
+  python -m deployment_scripts.tensorrt.export_onnx groot-n15 \
   --config configs/gr00t/gr00t_eagle_3b_libero_10_full_finetune.py \
   --checkpoint checkpoints/gr00t_eagle_3b_libero_10_full_finetune_bs64/checkpoints/step-028548-epoch-18-loss=0.0546.safetensors \
   --sequence-length 600
@@ -102,11 +119,13 @@ the formal experiment in this document.
 Run one real-plan inference for each model:
 
 ```bash
-python -m deployment_scripts.tensorrt.smoke_test pi05 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
+  python -m deployment_scripts.tensorrt.smoke_test pi05 \
   --engine-dir deployment_artifacts/engines/pi05 \
   --checkpoint checkpoints/pi05_paligemma_libero_10_full_finetune_bs64/checkpoints/step-038064-epoch-24-loss=0.0170.safetensors
 
-python -m deployment_scripts.tensorrt.smoke_test groot-n15 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
+  python -m deployment_scripts.tensorrt.smoke_test groot-n15 \
   --engine-dir deployment_artifacts/engines/groot_n15 \
   --checkpoint checkpoints/gr00t_eagle_3b_libero_10_full_finetune_bs64/checkpoints/step-028548-epoch-18-loss=0.0546.safetensors
 ```
@@ -115,11 +134,13 @@ Compare native PyTorch, the ONNX export wrapper, and TensorRT with identical
 synthetic inputs and explicit noise:
 
 ```bash
-python -m deployment_scripts.tensorrt.parity_check pi05 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
+  python -m deployment_scripts.tensorrt.parity_check pi05 \
   --engine-dir deployment_artifacts/engines/pi05 \
   --checkpoint checkpoints/pi05_paligemma_libero_10_full_finetune_bs64/checkpoints/step-038064-epoch-24-loss=0.0170.safetensors
 
-python -m deployment_scripts.tensorrt.parity_check groot-n15 \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
+  python -m deployment_scripts.tensorrt.parity_check groot-n15 \
   --engine-dir deployment_artifacts/engines/groot_n15 \
   --checkpoint checkpoints/gr00t_eagle_3b_libero_10_full_finetune_bs64/checkpoints/step-028548-epoch-18-loss=0.0546.safetensors
 ```
@@ -139,33 +160,37 @@ part of the latency metric.
 | GR00T-N1.5 PyTorch FP16  | `configs/gr00t/gr00t_eagle_3b_libero_10_pytorch_fp16.py` | Fair GR00T speed denominator         |
 | GR00T-N1.5 TensorRT FP16 | `configs/gr00t/gr00t_eagle_3b_libero_10_tensorrt.py`     | GR00T TensorRT                       |
 
-The supplied runner executes all five rows with the exact paired settings,
-keeps their raw artifacts in separate directories, and invokes the strict
-summarizer only after every run completes:
+The supplied runner executes all five rows with paired state, seed, checkpoint
+path, and solver settings, keeps their raw artifacts in separate directories,
+and invokes the strict summarizer only after every run completes:
 
 ```bash
 bash deployment_scripts/tensorrt/run_libero_benchmark.sh \
   3 benchmark_results/pi05_gr00t_tensorrt_gpu3
 ```
 
-The first argument is the physical GPU index and the second is a new output
-directory. The script records `CUDA_VISIBLE_DEVICES`, `nvidia-smi`, the Git
+The first argument is the physical GPU index and the second must be a new or
+empty output directory. The script rejects nonempty output directories to
+prevent stale artifacts from being mixed into a new run. It records
+`CUDA_VISIBLE_DEVICES`, `nvidia-smi`, the Git
 state, Python packages, all console logs, and the resolved directory of every
 run. Set `PI05_CHECKPOINT` or `GROOT_CHECKPOINT` only when the checkpoints are
 stored outside the documented default paths.
 
 Every run writes `time_profile/inference_calls.csv`. Its principal fields are:
 
-- `inference_ms`: synchronized `predict_action` time.
+- `inference_ms`: synchronized complete `predict_action` wall time, including
+  TensorRT execution and the surrounding PyTorch orchestration.
 - `pipeline_total_ms`: preprocessing + inference + output transfer + action
   denormalization.
 - module fields: CUDA-event attribution for PI0.5 V/P/D or GR00T backbone and
   action-head partitions.
 - `initial_state_sha256` and `inference_seed`: pairing evidence.
 
-Module attribution records CUDA Events and therefore adds a small, symmetric
-profiling overhead to `inference_ms`. The official plan-only numbers below are
-measured separately by `trtexec` without these events.
+Both paired paths enable the same stage schema and expected call counts;
+`inference_ms` includes their CUDA-event profiling overhead. The official
+plan-only numbers below are measured separately by `trtexec` without these
+events.
 
 The GR00T speedup is calculated from PyTorch FP16 versus TensorRT FP16. PyTorch
 BF16 is kept as a separate quality reference; comparing BF16 directly with
@@ -173,7 +198,8 @@ FP16 would mix backend and precision effects.
 
 ### Official plan benchmark
 
-Use `trtexec` to measure the serialized plans without H2D/D2H or CUDA Graph:
+Use `trtexec` with synthetic inputs to measure each serialized plan without
+H2D/D2H or CUDA Graph:
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
@@ -185,6 +211,10 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
   groot-n15 deployment_artifacts/engines/groot_n15 \
   benchmark_results/trtexec/groot_n15
 ```
+
+These standalone plan measurements exclude inter-plan PyTorch orchestration,
+tensor assembly, casts, random-number generation, and Euler updates. They are
+not complete VLA or rollout latency.
 
 ## 6. Performance
 

@@ -37,6 +37,16 @@ for checkpoint in "${pi05_checkpoint}" "${groot_checkpoint}"; do
     fi
 done
 
+if [[ -e "${benchmark_root}" && ! -d "${benchmark_root}" ]]; then
+    echo "Benchmark output exists and is not a directory: ${benchmark_root}"
+    exit 1
+fi
+if [[ -d "${benchmark_root}" ]] \
+    && [[ -n "$(find "${benchmark_root}" -mindepth 1 -print -quit)" ]]; then
+    echo "Benchmark output directory must be empty: ${benchmark_root}"
+    exit 1
+fi
+
 mkdir -p "${benchmark_root}/environment"
 PYTHONPATH="${project_pythonpath}" python - "${project_root}" \
     >"${benchmark_root}/environment/import_identity.txt" <<'PY'
