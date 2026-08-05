@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TensorRT-only PI0.5 LIBERO-10 evaluation configuration."""
+"""TensorRT-backed PI0.5 LIBERO-10 evaluation configuration."""
 
 _base_ = ['./pi05_paligemma_libero_10_full_finetune.py']
 

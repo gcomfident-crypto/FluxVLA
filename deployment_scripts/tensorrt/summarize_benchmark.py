@@ -458,6 +458,29 @@ def _write_summary(output: Path, runs: dict) -> None:
                     'mean_ms': f'{values["mean_ms"]:.6f}',
                     'std_ms': f'{values["std_ms"]:.6f}',
                 })
+    with (output / 'task_summary.csv').open(
+            'w', newline='', encoding='utf-8') as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=('key', 'model', 'backend', 'task_id', 'successes',
+                        'trials', 'success_rate', 'task_description'))
+        writer.writeheader()
+        for key in RUN_KEYS:
+            model, backend = EXPECTED[key]['label']
+            for task_id in range(10):
+                result = runs[key]['task_results'][f'libero_10_{task_id}']
+                trials = int(result['total_episodes'])
+                successes = int(result['successes'])
+                writer.writerow({
+                    'key': key,
+                    'model': model,
+                    'backend': backend,
+                    'task_id': task_id,
+                    'successes': successes,
+                    'trials': trials,
+                    'success_rate': f'{successes / trials * 100.0:.6f}',
+                    'task_description': result['task_description'],
+                })
     (output / 'benchmark_data.json').write_text(
         json.dumps(runs, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 
@@ -488,7 +511,7 @@ def _plot(output: Path, runs: dict, visible_device: str) -> None:
                   inference,
                   height=0.34,
                   color=colors[1],
-                  label='Model inference')
+                  label='Policy inference')
         for position, (pipeline_ms,
                        inference_ms) in enumerate(zip(pipeline, inference)):
             axis.text(
@@ -503,14 +526,21 @@ def _plot(output: Path, runs: dict, visible_device: str) -> None:
                 va='center')
         axis.set_yticks(list(positions), labels)
         axis.set_title(model)
-        axis.set_xlabel('Mean latency per model call (ms)')
+        axis.set_xlabel('Mean latency per policy call (ms)')
         axis.grid(axis='x', alpha=0.25)
-        axis.legend(loc='lower right')
+    handles, labels = axes[0].get_legend_handles_labels()
+    figure.legend(
+        handles,
+        labels,
+        loc='upper center',
+        bbox_to_anchor=(0.5, 0.94),
+        ncol=2)
     device_name = runs[RUN_KEYS[0]]['environment']['device_name']
     figure.suptitle(
         f'FluxVLA PyTorch vs TensorRT on LIBERO-10 - {device_name} '
-        f'(physical GPU {visible_device})')
-    figure.tight_layout()
+        f'(physical GPU {visible_device})',
+        y=0.99)
+    figure.tight_layout(rect=(0, 0, 1, 0.89))
     figure.savefig(output / 'pytorch_vs_tensorrt.png', dpi=180)
     plt.close(figure)
 
