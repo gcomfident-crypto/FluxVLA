@@ -7,7 +7,6 @@
 *.tiff
 *.svg
 *.webp
-!deployment_scripts/tensorrt/assets/*.png
 
 # Keep the real-robot demo used by the READMEs
 !/docs/fluxvla-real-robot-demo-compressed.gif

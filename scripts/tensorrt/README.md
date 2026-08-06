@@ -86,13 +86,13 @@ is retained for FluxVLA API, batch, dtype, and device compatibility.
 ```bash
 # PI0.5
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
-  python -m deployment_scripts.tensorrt.export_onnx pi05 \
+  python -m scripts.tensorrt.export_onnx pi05 \
   --config configs/pi05/pi05_paligemma_libero_10_full_finetune.py \
   --checkpoint checkpoints/pi05_paligemma_libero_10_full_finetune_bs64/checkpoints/step-038064-epoch-24-loss=0.0170.safetensors
 
 # GR00T-N1.5
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
-  python -m deployment_scripts.tensorrt.export_onnx groot-n15 \
+  python -m scripts.tensorrt.export_onnx groot-n15 \
   --config configs/gr00t/gr00t_eagle_3b_libero_10_full_finetune.py \
   --checkpoint checkpoints/gr00t_eagle_3b_libero_10_full_finetune_bs64/checkpoints/step-028548-epoch-18-loss=0.0546.safetensors \
   --sequence-length 600
@@ -107,11 +107,11 @@ and checkpoint identity.
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
-  bash deployment_scripts/tensorrt/build_engine.sh \
+  bash scripts/tensorrt/build_engine.sh \
   pi05 deployment_artifacts/onnx/pi05 deployment_artifacts/engines/pi05
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
-  bash deployment_scripts/tensorrt/build_engine.sh \
+  bash scripts/tensorrt/build_engine.sh \
   groot-n15 deployment_artifacts/onnx/groot_n15 \
   deployment_artifacts/engines/groot_n15
 ```
@@ -128,12 +128,12 @@ Run one real-plan inference for each model:
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
-  python -m deployment_scripts.tensorrt.smoke_test pi05 \
+  python -m scripts.tensorrt.smoke_test pi05 \
   --engine-dir deployment_artifacts/engines/pi05 \
   --checkpoint checkpoints/pi05_paligemma_libero_10_full_finetune_bs64/checkpoints/step-038064-epoch-24-loss=0.0170.safetensors
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
-  python -m deployment_scripts.tensorrt.smoke_test groot-n15 \
+  python -m scripts.tensorrt.smoke_test groot-n15 \
   --engine-dir deployment_artifacts/engines/groot_n15 \
   --checkpoint checkpoints/gr00t_eagle_3b_libero_10_full_finetune_bs64/checkpoints/step-028548-epoch-18-loss=0.0546.safetensors
 ```
@@ -143,12 +143,12 @@ synthetic inputs and explicit noise:
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
-  python -m deployment_scripts.tensorrt.parity_check pi05 \
+  python -m scripts.tensorrt.parity_check pi05 \
   --engine-dir deployment_artifacts/engines/pi05 \
   --checkpoint checkpoints/pi05_paligemma_libero_10_full_finetune_bs64/checkpoints/step-038064-epoch-24-loss=0.0170.safetensors
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
-  python -m deployment_scripts.tensorrt.parity_check groot-n15 \
+  python -m scripts.tensorrt.parity_check groot-n15 \
   --engine-dir deployment_artifacts/engines/groot_n15 \
   --checkpoint checkpoints/gr00t_eagle_3b_libero_10_full_finetune_bs64/checkpoints/step-028548-epoch-18-loss=0.0546.safetensors
 ```
@@ -174,7 +174,7 @@ keeps their raw artifacts in separate directories, and invokes the strict
 summarizer only after every run completes:
 
 ```bash
-bash deployment_scripts/tensorrt/run_libero_benchmark.sh \
+bash scripts/tensorrt/run_libero_benchmark.sh \
   3 benchmark_results/pi05_gr00t_tensorrt_gpu3
 ```
 
@@ -219,11 +219,11 @@ H2D/D2H or CUDA Graph:
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
-  bash deployment_scripts/tensorrt/benchmark_engines.sh \
+  bash scripts/tensorrt/benchmark_engines.sh \
   pi05 deployment_artifacts/engines/pi05 benchmark_results/trtexec/pi05
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=3 \
-  bash deployment_scripts/tensorrt/benchmark_engines.sh \
+  bash scripts/tensorrt/benchmark_engines.sh \
   groot-n15 deployment_artifacts/engines/groot_n15 \
   benchmark_results/trtexec/groot_n15
 ```
@@ -284,8 +284,6 @@ its BF16 baseline. GR00T TensorRT changed observed success by -1.6 points
 relative to the fair FP16 baseline; most of the difference occurred on task 8.
 These are single-seed 50-trial observations, not a statistical equivalence
 claim.
-
-![PyTorch versus TensorRT latency](assets/pi05_gr00t_pytorch_vs_tensorrt_gpu3.png)
 
 ### 6.3 Per-task success
 

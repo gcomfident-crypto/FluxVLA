@@ -16,9 +16,9 @@
 # Build FluxVLA TensorRT engines from ONNX without running a benchmark.
 #
 # Usage:
-#   bash deployment_scripts/tensorrt/build_engine.sh \
+#   bash scripts/tensorrt/build_engine.sh \
 #     pi05 deployment_artifacts/onnx/pi05 deployment_artifacts/engines/pi05
-#   bash deployment_scripts/tensorrt/build_engine.sh \
+#   bash scripts/tensorrt/build_engine.sh \
 #     groot-n15 deployment_artifacts/onnx/groot_n15 \
 #     deployment_artifacts/engines/groot_n15
 

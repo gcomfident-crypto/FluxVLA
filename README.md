@@ -1012,7 +1012,7 @@ If you use VLM-based SARM annotation, place the official SARM VLM under `./check
 - Supports remote inference infrastructure with ZMQ-based server/client architecture, enabling GPU-offloaded inference for resource-constrained edge devices. See [Remote Inference Serving](docs/remote_inference_serving.md).
 - Supports [RTC (Real-Time Chunking)](docs/rtc.md) to improve cross-chunk trajectory continuity.
 - Supports accelerated inference for GR00T and PI0.5; see [Inference Acceleration](docs/inference_acceleration.md), including Triton fused kernels, CUDA Graph capture, and CUDA custom operators.
-- Supports TensorRT engine export and runtime deployment for GR00T-N1.5 and PI0.5; see [TensorRT Deployment](deployment_scripts/tensorrt/README.md).
+- Supports TensorRT engine export and runtime deployment for GR00T-N1.5 and PI0.5; see [TensorRT Deployment](scripts/tensorrt/README.md).
 - Provides a minimal Oli humanoid whole-body (loco-manipulation) real-robot inference path (rospy sensor input + WebSocket control; base/hand commands are robot-SDK integration points). See [docs/oli_whole_body.md](docs/oli_whole_body.md).
 
 </details>
