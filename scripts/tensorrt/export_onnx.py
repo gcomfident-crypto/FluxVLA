@@ -21,11 +21,11 @@ Examples:
 
 .. code-block:: bash
 
-   python -m deployment_scripts.tensorrt.export_onnx pi05 \
+   python -m scripts.tensorrt.export_onnx pi05 \
      --config configs/pi05/pi05_paligemma_libero_10_full_finetune.py \
      --checkpoint checkpoints/pi05_libero/model.safetensors
 
-   python -m deployment_scripts.tensorrt.export_onnx groot-n15 \
+   python -m scripts.tensorrt.export_onnx groot-n15 \
      --config configs/gr00t/gr00t_eagle_3b_libero_10_full_finetune.py \
      --checkpoint /path/to/fine_tuned.safetensors --sequence-length 600
 """

@@ -53,7 +53,7 @@ def _require_tensorrt():
             'TensorRT Python bindings are required. On the supported Linux '
             'x86_64 reference environment, install tensorrt-cu12==11.1.0.106 '
             'from the NVIDIA Python package index. Source-checkout users can '
-            'also follow deployment_scripts/tensorrt/README.md.') from exc
+            'also follow scripts/tensorrt/README.md.') from exc
     return trt
 
 

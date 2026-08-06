@@ -1,6 +1,6 @@
 # Install on top of the normal FluxVLA environment.
 # This is the Linux x86_64 reference path and does not install trtexec.
-# See deployment_scripts/tensorrt/README.md for the platform support matrix.
+# See scripts/tensorrt/README.md for the platform support matrix.
 --extra-index-url https://pypi.nvidia.com
 
 onnx==1.18.0

@@ -159,7 +159,7 @@ run_group groot_tensorrt_fp16 \
     configs/gr00t/gr00t_eagle_3b_libero_10_tensorrt.py \
     "${groot_checkpoint}" tensorrt groot_n15
 
-python -m deployment_scripts.tensorrt.summarize_benchmark \
+python -m scripts.tensorrt.summarize_benchmark \
     --pi05-pytorch-bf16 "${benchmark_runs[pi05_pytorch_bf16]}" \
     --pi05-tensorrt-bf16 "${benchmark_runs[pi05_tensorrt_bf16]}" \
     --groot-pytorch-bf16 "${benchmark_runs[groot_pytorch_bf16]}" \
