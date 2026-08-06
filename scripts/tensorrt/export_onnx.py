@@ -587,7 +587,7 @@ def parse_args():
     parser.add_argument('--checkpoint', required=True, type=Path)
     parser.add_argument(
         '--output-dir', type=Path, default=Path('deployment_artifacts/onnx'))
-    parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--device', default='cuda')
     parser.add_argument('--opset', type=int, default=19)
     parser.add_argument('--image-views', type=int, default=2)
     parser.add_argument('--language-tokens', type=int, default=180)
