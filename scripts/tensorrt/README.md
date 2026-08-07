@@ -31,6 +31,10 @@ trtexec --version
 
 Run the following commands from the FluxVLA repository root.
 
+The `scripts/tensorrt` directory intentionally has no `__init__.py`. Adding
+one would shadow NVIDIA's top-level `tensorrt` package when `scripts/eval.py`
+is launched by file path.
+
 ### Supported profiles
 
 | Model      | Floating-point profile                                         | Static profile                                                                    |
