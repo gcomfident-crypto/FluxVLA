@@ -68,22 +68,25 @@ expected = {
     'groot-n15': ('vit', 'llm', 'backbone_output', 'state_encoder',
                   'action_encoder', 'dit', 'action_decoder'),
 }[model]
-canonical_files = {
-    'pi05': {
+if model == 'pi05':
+    canonical_files = {
         'vision': 'vision.onnx',
         'prefix': 'prefix.onnx',
         'denoise': 'denoise.onnx',
-    },
-    'groot-n15': {
-        'vit': 'vit_fp16.onnx',
-        'llm': 'llm_fp16.onnx',
+    }
+else:
+    precision = manifest['precision']
+    if precision not in ('fp16', 'bf16'):
+        raise ValueError(f'Unsupported GR00T precision: {precision!r}')
+    canonical_files = {
+        'vit': f'vit_{precision}.onnx',
+        'llm': f'llm_{precision}.onnx',
         'backbone_output': 'vlln_vl_self_attention.onnx',
         'state_encoder': 'state_encoder.onnx',
         'action_encoder': 'action_encoder.onnx',
-        'dit': 'dit_fp16.onnx',
+        'dit': f'dit_{precision}.onnx',
         'action_decoder': 'action_decoder.onnx',
-    },
-}[model]
+    }
 artifacts = manifest.get('onnx_artifacts')
 if not isinstance(artifacts, dict) or set(artifacts) != set(expected):
     raise ValueError('Export manifest ONNX artifact identities are missing')
@@ -148,17 +151,29 @@ if [[ "${MODEL}" == "pi05" ]]; then
     build_engine prefix "${ONNX_DIR}/prefix.onnx"
     build_engine denoise "${ONNX_DIR}/denoise.onnx"
 elif [[ "${MODEL}" == "groot-n15" ]]; then
+    PRECISION=$(python3 - "${MANIFEST}" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+precision = manifest['precision']
+if precision not in ('fp16', 'bf16'):
+    raise ValueError(f'Unsupported GR00T precision: {precision!r}')
+print(precision)
+PY
+    )
     # GR00T-N1.5 v1 is a fully static deployment profile.  Shape information
     # is embedded in each ONNX graph, so no TensorRT optimization profile is
     # supplied here.  This keeps the plans aligned with the runtime contract:
     # batch 1, two image views, sequence length 600, and action horizon 10.
-    build_engine vit_fp16 "${ONNX_DIR}/vit_fp16.onnx"
-    build_engine llm_fp16 "${ONNX_DIR}/llm_fp16.onnx"
+    build_engine "vit_${PRECISION}" "${ONNX_DIR}/vit_${PRECISION}.onnx"
+    build_engine "llm_${PRECISION}" "${ONNX_DIR}/llm_${PRECISION}.onnx"
     build_engine vlln_vl_self_attention \
         "${ONNX_DIR}/vlln_vl_self_attention.onnx"
     build_engine state_encoder "${ONNX_DIR}/state_encoder.onnx"
     build_engine action_encoder "${ONNX_DIR}/action_encoder.onnx"
-    build_engine dit_fp16 "${ONNX_DIR}/dit_fp16.onnx"
+    build_engine "dit_${PRECISION}" "${ONNX_DIR}/dit_${PRECISION}.onnx"
     build_engine action_decoder "${ONNX_DIR}/action_decoder.onnx"
 else
     echo "Unsupported model: ${MODEL}; expected pi05 or groot-n15"
@@ -178,12 +193,15 @@ engine_dir = pathlib.Path(sys.argv[2])
 model = sys.argv[3]
 trtexec = sys.argv[4]
 manifest = json.loads(source.read_text(encoding='utf-8'))
-expected = {
-    'pi05': ('vision', 'prefix', 'denoise'),
-    'groot-n15': ('vit_fp16', 'llm_fp16',
-                  'vlln_vl_self_attention', 'state_encoder',
-                  'action_encoder', 'dit_fp16', 'action_decoder'),
-}[model]
+if model == 'pi05':
+    expected = ('vision', 'prefix', 'denoise')
+else:
+    precision = manifest['precision']
+    if precision not in ('fp16', 'bf16'):
+        raise ValueError(f'Unsupported GR00T precision: {precision!r}')
+    expected = (f'vit_{precision}', f'llm_{precision}',
+                'vlln_vl_self_attention', 'state_encoder',
+                'action_encoder', f'dit_{precision}', 'action_decoder')
 engines = {}
 for name in expected:
     path = engine_dir / f'{name}.engine'

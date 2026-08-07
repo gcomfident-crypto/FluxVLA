@@ -21,10 +21,11 @@ from typing import Optional
 import torch
 
 from fluxvla.deployment.tensorrt.groot_n15 import (
-    GR00TN15ActionHeadTensorRTInference, GR00TN15TensorRTContract)
+    GR00TN15ActionHeadTensorRTInference, GR00TN15TensorRTContract,
+    groot_dtype_precision)
 from fluxvla.deployment.tensorrt.groot_n15.runtime import \
     _validate_embodiment_metadata
-from fluxvla.engines import HEADS
+from fluxvla.engines import HEADS, str_to_dtype
 from fluxvla.engines.utils.inference_profile import (begin_module_profile,
                                                      configure_module_profile,
                                                      module_stage,
@@ -51,6 +52,7 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
     def __init__(
         self,
         engine_dir: str | Path,
+        dtype: str,
         image_views: int = 2,
         sequence_length: int = 600,
         image_size: int = 224,
@@ -61,7 +63,11 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
         strict_manifest: bool = True,
         **kwargs,
     ) -> None:
+        trt_dtype = str_to_dtype(dtype)
+        trt_precision = groot_dtype_precision(trt_dtype)
         super().__init__(**kwargs)
+        self._trt_dtype = trt_dtype
+        self._trt_precision = trt_precision
         state_dim = int(self.state_encoder.layer1.W.shape[1])
         self.max_num_embodiments = int(self.action_encoder.num_embodiments)
         future_tokens = int(self.future_tokens.num_embeddings)
@@ -87,6 +93,7 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
         self.trt_runtime = GR00TN15ActionHeadTensorRTInference(
             engine_dir,
             contract=contract,
+            precision=self._trt_precision,
             profile_index=profile_index,
             strict_manifest=strict_manifest)
         self.trt_contract = contract
@@ -110,10 +117,11 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
             raise RuntimeError(
                 'Move the GR00T model to its CUDA device before preparing '
                 'TensorRT')
-        if any(parameter.dtype != torch.float16
+        if any(parameter.dtype != self._trt_dtype
                for parameter in retained_parameters):
             raise RuntimeError(
-                'GR00T-N1.5 TensorRT retained layers must use FP16')
+                'GR00T-N1.5 TensorRT retained layers must use '
+                f'{self._trt_precision.upper()}')
         # NVIDIA's official setup releases the PyTorch partitions before
         # loading their plans to keep peak device memory bounded.
         self._trt_release_started = True
@@ -245,9 +253,9 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
             if source is not None:
                 source.record_stream(selected_stream)
         with torch.cuda.stream(selected_stream):
-            features = input_features.to(torch.float16).contiguous()
+            features = input_features.to(self._trt_dtype).contiguous()
             embodiment = embodiment_ids.to(torch.int64).contiguous()
-            state = states.to(torch.float16).unsqueeze(1).contiguous()
+            state = states.to(self._trt_dtype).unsqueeze(1).contiguous()
             with module_stage(self, 'backbone_processor', selected_stream):
                 features = self.trt_runtime.process_backbone(
                     features, selected_stream)
@@ -261,7 +269,7 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
                         c.batch,
                         c.action_horizon,
                         c.action_dim,
-                        dtype=torch.float16,
+                        dtype=self._trt_dtype,
                         device=device)
                 else:
                     if type(seed) is not int or seed < 0:
@@ -274,9 +282,9 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
                         c.action_dim,
                         dtype=torch.float32,
                         device=device,
-                        generator=generator).to(torch.float16)
+                        generator=generator).to(self._trt_dtype)
             else:
-                actions = noise.to(torch.float16).contiguous()
+                actions = noise.to(self._trt_dtype).contiguous()
 
             timestep = torch.empty((c.batch, ),
                                    dtype=torch.int64,
@@ -284,8 +292,9 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
             position_ids = torch.arange(
                 c.action_horizon, dtype=torch.long, device=device)
             position = self.position_embedding(position_ids).unsqueeze(0)
-            position = position.to(torch.float16)
-            future = self.future_tokens.weight.unsqueeze(0).to(torch.float16)
+            position = position.to(self._trt_dtype)
+            future = self.future_tokens.weight.unsqueeze(0).to(
+                self._trt_dtype)
             dt = 1.0 / c.denoise_steps
 
             with module_stage(self, 'action_expert', selected_stream):

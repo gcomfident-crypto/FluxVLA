@@ -15,10 +15,14 @@
 
 from .contract import GR00TN15TensorRTContract
 from .runtime import (GR00TN15ActionHeadTensorRTInference,
-                      GR00TN15BackboneTensorRTInference)
+                      GR00TN15BackboneTensorRTInference,
+                      groot_dtype_precision,
+                      groot_precision_dtype)
 
 __all__ = [
     'GR00TN15TensorRTContract',
     'GR00TN15BackboneTensorRTInference',
     'GR00TN15ActionHeadTensorRTInference',
+    'groot_dtype_precision',
+    'groot_precision_dtype',
 ]

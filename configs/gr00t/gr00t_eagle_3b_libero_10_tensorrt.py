@@ -38,6 +38,7 @@ inference_model = dict(
     vla_head=dict(
         type='FlowMatchingTensorRTHead',
         engine_dir=_engine_dir,
+        dtype='float16',
         image_views=2,
         sequence_length=600,
         state_dim=64,

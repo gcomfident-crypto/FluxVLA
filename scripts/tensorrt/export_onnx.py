@@ -27,7 +27,8 @@ Examples:
 
    python -m scripts.tensorrt.export_onnx groot-n15 \
      --config configs/gr00t/gr00t_eagle_3b_libero_10_full_finetune.py \
-     --checkpoint /path/to/fine_tuned.safetensors --sequence-length 600
+     --checkpoint /path/to/fine_tuned.safetensors --sequence-length 600 \
+     --precision fp16
 """
 
 from __future__ import annotations
@@ -91,13 +92,12 @@ def _load_checkpoint_state(checkpoint: Path) -> Mapping[str, torch.Tensor]:
 def _construction_dtype_name(dtype: torch.dtype) -> str:
     names = {
         torch.float16: 'float16',
-        torch.bfloat16: 'bfloat16',
+        torch.bfloat16: 'bf16',
         torch.float32: 'float32',
     }
-    try:
-        return names[dtype]
-    except KeyError as exc:
-        raise ValueError(f'Unsupported export dtype: {dtype}') from exc
+    if dtype not in names:
+        raise ValueError(f'Unsupported export dtype: {dtype}')
+    return names[dtype]
 
 
 def _load_model(config_path: Path, checkpoint: Path | None,
@@ -114,12 +114,9 @@ def _load_model(config_path: Path, checkpoint: Path | None,
     from fluxvla.engines import build_vla_from_cfg
 
     cfg = Config.fromfile(str(config_path))
-    # Eagle constructs its VLM directly in the configured dtype.  Override
-    # that construction dtype before loading the checkpoint so GR00T follows
-    # the same FP32-checkpoint -> FP16 rounding path as the runtime adapter.
-    # Constructing it as BF16 first and converting BF16 -> FP16 later changes
-    # most weights and makes the serialized engines disagree with the retained
-    # PyTorch embedding/connector weights.
+    # Eagle constructs its VLM directly in the configured dtype. Override that
+    # dtype before loading the checkpoint so exported and retained layers use
+    # the same direct conversion from checkpoint weights.
     vlm_backbone = cfg.model.get('vlm_backbone')
     if isinstance(vlm_backbone, Mapping) and 'dtype' in vlm_backbone:
         vlm_backbone['dtype'] = _construction_dtype_name(dtype)
@@ -391,13 +388,20 @@ def _set_eager_attention(module: torch.nn.Module) -> None:
 
 
 def export_groot(args) -> None:
-    with _staged_output_dir(args.output_dir / 'groot_n15') as output_dir:
+    output_name = ('groot_n15' if args.precision == 'fp16' else
+                   'groot_n15_bf16')
+    with _staged_output_dir(args.output_dir / output_name) as output_dir:
         _export_groot(args, output_dir)
 
 
 def _export_groot(args, output_dir: Path) -> None:
     device = torch.device(args.device)
-    model = _load_model(args.config, args.checkpoint, device, torch.float16)
+    dtypes = {
+        'fp16': torch.float16,
+        'bf16': torch.bfloat16,
+    }
+    dtype = dtypes[args.precision]
+    model = _load_model(args.config, args.checkpoint, device, dtype)
     if not hasattr(model, 'vlm_backbone') or not hasattr(model, 'vla_head'):
         raise TypeError('GR00T export requires LlavaVLA with Eagle backbone '
                         'and FlowMatchingHead')
@@ -430,7 +434,7 @@ def _export_groot(args, output_dir: Path) -> None:
         3,
         image_size,
         image_size,
-        dtype=torch.float16,
+        dtype=dtype,
         device=device)
     position_ids = torch.arange(
         num_patches, dtype=torch.int64,
@@ -438,7 +442,8 @@ def _export_groot(args, output_dir: Path) -> None:
     onnx_artifacts = {}
     onnx_artifacts['vit'] = _export(
         vision, (pixel_values, position_ids),
-        output_dir / 'vit_fp16.onnx', ('pixel_values', 'position_ids'),
+        output_dir / f'vit_{args.precision}.onnx',
+        ('pixel_values', 'position_ids'),
         ('vit_embeds', ),
         opset=args.opset)
 
@@ -448,13 +453,14 @@ def _export_groot(args, output_dir: Path) -> None:
         1,
         args.sequence_length,
         llm_hidden,
-        dtype=torch.float16,
+        dtype=dtype,
         device=device)
     attention_mask = torch.ones(
         1, args.sequence_length, dtype=torch.int64, device=device)
     onnx_artifacts['llm'] = _export(
         llm, (inputs_embeds, attention_mask),
-        output_dir / 'llm_fp16.onnx', ('inputs_embeds', 'attention_mask'),
+        output_dir / f'llm_{args.precision}.onnx',
+        ('inputs_embeds', 'attention_mask'),
         ('embeddings', ),
         opset=args.opset)
 
@@ -464,7 +470,7 @@ def _export_groot(args, output_dir: Path) -> None:
         1,
         args.sequence_length,
         backbone_dim,
-        dtype=torch.float16,
+        dtype=dtype,
         device=device)
     onnx_artifacts['backbone_output'] = _export(
         process, (backbone_features, ),
@@ -475,7 +481,7 @@ def _export_groot(args, output_dir: Path) -> None:
     batch = 1
     embodiment = torch.zeros(batch, dtype=torch.int64, device=device)
     state = torch.randn(
-        batch, 1, args.state_dim, dtype=torch.float16, device=device)
+        batch, 1, args.state_dim, dtype=dtype, device=device)
     onnx_artifacts['state_encoder'] = _export(
         head.state_encoder, (state, embodiment),
         output_dir / 'state_encoder.onnx', ('state', 'embodiment_id'),
@@ -486,7 +492,7 @@ def _export_groot(args, output_dir: Path) -> None:
         batch,
         args.action_horizon,
         args.action_dim,
-        dtype=torch.float16,
+        dtype=dtype,
         device=device)
     timestep = torch.zeros(batch, dtype=torch.int64, device=device)
     onnx_artifacts['action_encoder'] = _export(
@@ -502,17 +508,17 @@ def _export_groot(args, output_dir: Path) -> None:
         batch,
         sa_length,
         input_embedding_dim,
-        dtype=torch.float16,
+        dtype=dtype,
         device=device)
     vl_embs = torch.randn(
         batch,
         args.sequence_length,
         backbone_dim,
-        dtype=torch.float16,
+        dtype=dtype,
         device=device)
     onnx_artifacts['dit'] = _export(
         head.model, (sa_embs, vl_embs, timestep),
-        output_dir / 'dit_fp16.onnx',
+        output_dir / f'dit_{args.precision}.onnx',
         ('sa_embs', 'vl_embs', 'timesteps_tensor'), ('output', ),
         opset=args.opset)
 
@@ -520,7 +526,7 @@ def _export_groot(args, output_dir: Path) -> None:
         batch,
         sa_length,
         int(head.hidden_size),
-        dtype=torch.float16,
+        dtype=dtype,
         device=device)
     onnx_artifacts['action_decoder'] = _export(
         head.action_decoder, (model_output, embodiment),
@@ -537,7 +543,7 @@ def _export_groot(args, output_dir: Path) -> None:
             'model':
             'groot-n15',
             'precision':
-            'fp16',
+            args.precision,
             'config':
             args.config.name,
             'checkpoint': (args.checkpoint.name if args.checkpoint else None),
@@ -567,12 +573,12 @@ def _export_groot(args, output_dir: Path) -> None:
                 'denoise_steps': int(head.num_inference_timesteps),
             },
             'onnx': {
-                'vit': 'vit_fp16.onnx',
-                'llm': 'llm_fp16.onnx',
+                'vit': f'vit_{args.precision}.onnx',
+                'llm': f'llm_{args.precision}.onnx',
                 'backbone_output': 'vlln_vl_self_attention.onnx',
                 'state_encoder': 'state_encoder.onnx',
                 'action_encoder': 'action_encoder.onnx',
-                'dit': 'dit_fp16.onnx',
+                'dit': f'dit_{args.precision}.onnx',
                 'action_decoder': 'action_decoder.onnx',
             },
             'onnx_artifacts':
@@ -592,6 +598,7 @@ def parse_args():
     parser.add_argument('--image-views', type=int, default=2)
     parser.add_argument('--language-tokens', type=int, default=180)
     parser.add_argument('--sequence-length', type=int, default=600)
+    parser.add_argument('--precision', choices=('fp16', 'bf16'))
     parser.add_argument('--state-dim', type=int, default=64)
     parser.add_argument('--action-horizon', type=int, default=10)
     parser.add_argument('--action-dim', type=int, default=32)
@@ -611,10 +618,15 @@ def main() -> None:
     if not args.config.is_file():
         raise FileNotFoundError(f'Config not found: {args.config}')
     if args.model == 'pi05':
+        if args.precision is not None:
+            raise ValueError('--precision applies only to GR00T-N1.5')
         args.denoise_steps = (10 if args.denoise_steps is None else
                               args.denoise_steps)
         export_pi05(args)
     else:
+        if args.precision is None:
+            raise ValueError(
+                '--precision is required for GR00T-N1.5 (fp16 or bf16)')
         if args.denoise_steps is not None:
             raise ValueError(
                 '--denoise-steps applies only to PI0.5; GR00T-N1.5 uses '

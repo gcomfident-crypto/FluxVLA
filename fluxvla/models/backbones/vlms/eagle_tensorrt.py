@@ -21,8 +21,9 @@ from typing import Dict, Optional
 import torch
 
 from fluxvla.deployment.tensorrt.groot_n15 import (
-    GR00TN15BackboneTensorRTInference, GR00TN15TensorRTContract)
-from fluxvla.engines import VLM_BACKBONES
+    GR00TN15BackboneTensorRTInference, GR00TN15TensorRTContract,
+    groot_dtype_precision)
+from fluxvla.engines import VLM_BACKBONES, str_to_dtype
 # yapf: disable
 from fluxvla.engines.utils.inference_profile import (begin_module_profile,
                                                      configure_module_profile,
@@ -66,6 +67,8 @@ class EagleTensorRTBackbone(EagleBackbone):
         profile_index: int = 0,
         strict_manifest: bool = True,
     ) -> None:
+        trt_dtype = str_to_dtype(dtype)
+        trt_precision = groot_dtype_precision(trt_dtype)
         super().__init__(
             vlm_path=vlm_path,
             vlm_config=vlm_config,
@@ -73,6 +76,8 @@ class EagleTensorRTBackbone(EagleBackbone):
             select_layer=select_layer,
             dtype=dtype,
             attention_implementation='eager')
+        self._trt_dtype = trt_dtype
+        self._trt_precision = trt_precision
         config = self.vlm.config
         image_size = int(config.force_image_size
                          or config.vision_config.image_size)
@@ -102,6 +107,7 @@ class EagleTensorRTBackbone(EagleBackbone):
         self.trt_runtime = GR00TN15BackboneTensorRTInference(
             engine_dir,
             contract=contract,
+            precision=self._trt_precision,
             profile_index=profile_index,
             strict_manifest=strict_manifest)
         self.trt_contract = contract
@@ -134,10 +140,11 @@ class EagleTensorRTBackbone(EagleBackbone):
             raise RuntimeError(
                 'Move the GR00T model to its CUDA device before preparing '
                 'TensorRT')
-        if any(parameter.dtype != torch.float16
+        if any(parameter.dtype != self._trt_dtype
                for parameter in retained_parameters):
             raise RuntimeError(
-                'GR00T-N1.5 TensorRT retained layers must use FP16')
+                'GR00T-N1.5 TensorRT retained layers must use '
+                f'{self._trt_precision.upper()}')
         # Follow NVIDIA's official deployment order: retain the lightweight
         # embedding/connector, release engine-covered modules, return their
         # cached allocations, and only then deserialize the plans.  This
@@ -231,7 +238,7 @@ class EagleTensorRTBackbone(EagleBackbone):
             start_module_stage(self, 'backbone_total', stream)
             pixel_values = images.reshape(c.image_views, 3, c.image_size,
                                           c.image_size).to(
-                                              torch.float16).contiguous()
+                                              self._trt_dtype).contiguous()
             position_ids = self._trt_position_ids.contiguous()
             with module_stage(self, 'vit', stream):
                 vit_embeds = self.trt_runtime.run_vision(
@@ -249,7 +256,7 @@ class EagleTensorRTBackbone(EagleBackbone):
                 vit_embeds = vit_embeds.reshape(c.image_views, -1,
                                                 vit_embeds.shape[-1])
             vit_embeds = self.vlm.mlp1(vit_embeds).to(
-                torch.float16).contiguous()
+                self._trt_dtype).contiguous()
             if vit_embeds.shape[1] != c.projected_image_tokens_per_view:
                 raise ValueError(
                     'Eagle projected image-token count does not match the '
@@ -257,7 +264,7 @@ class EagleTensorRTBackbone(EagleBackbone):
             vit_embeds = vit_embeds.reshape(c.batch, -1, c.backbone_dim)
 
             tokens = lang_tokens.to(torch.int64).contiguous()
-            input_embeds = self._embedding_layer(tokens).to(torch.float16)
+            input_embeds = self._embedding_layer(tokens).to(self._trt_dtype)
             flat_embeds = input_embeds.reshape(-1, c.backbone_dim).contiguous()
             selected = tokens.reshape(-1) == self._image_token_index
             # Boolean assignment already raises on a source/selection shape

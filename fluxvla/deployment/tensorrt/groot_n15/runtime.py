@@ -32,6 +32,26 @@ from ..runtime import TensorRTRuntime, TensorSpec
 from .contract import GR00TN15TensorRTContract
 
 
+def groot_precision_dtype(precision: str) -> torch.dtype:
+    dtypes = {
+        'fp16': torch.float16,
+        'bf16': torch.bfloat16,
+    }
+    if precision not in dtypes:
+        raise ValueError(f'Unsupported GR00T TensorRT precision: {precision}')
+    return dtypes[precision]
+
+
+def groot_dtype_precision(dtype: torch.dtype) -> str:
+    names = {
+        torch.float16: 'fp16',
+        torch.bfloat16: 'bf16',
+    }
+    if dtype not in names:
+        raise ValueError(f'Unsupported GR00T TensorRT dtype: {dtype}')
+    return names[dtype]
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open('rb') as stream:
@@ -78,7 +98,8 @@ def _manifest_contract(contract: GR00TN15TensorRTContract) -> dict:
 
 
 def _validate_manifest(engine_dir: Path, contract: GR00TN15TensorRTContract,
-                       engine_names: tuple[str, ...]) -> Mapping:
+                       engine_names: tuple[str, ...],
+                       precision: str) -> Mapping:
     path = engine_dir / 'engine_manifest.json'
     if not path.is_file():
         raise FileNotFoundError(f'GR00T engine manifest not found: {path}')
@@ -91,8 +112,10 @@ def _validate_manifest(engine_dir: Path, contract: GR00TN15TensorRTContract,
         raise ValueError('Engine manifest is not for GR00T-N1.5')
     if value.get('shape_mode') != 'static':
         raise ValueError('GR00T-N1.5 engine manifest must use static shapes')
-    if value.get('precision') != 'fp16':
-        raise ValueError('GR00T-N1.5 production plans must use FP16')
+    if value['precision'] != precision:
+        raise ValueError('GR00T-N1.5 engine precision does not match the '
+                         f'configured precision: {value["precision"]} != '
+                         f'{precision}')
     if value.get('cuda_graph') is not False:
         raise ValueError('GR00T-N1.5 production runtime forbids CUDA Graphs')
     trt_version = value.get('tensorrt_version')
@@ -134,36 +157,40 @@ def _validate_manifest(engine_dir: Path, contract: GR00TN15TensorRTContract,
 
 def _backbone_specs(
     contract: GR00TN15TensorRTContract,
+    precision: str,
 ) -> Mapping[str, tuple[TensorSpec, ...]]:
+    dtype = groot_precision_dtype(precision)
     return {
-        'vit_fp16': (
+        f'vit_{precision}': (
             TensorSpec('pixel_values', 'input',
                        (contract.image_views, 3, contract.image_size,
-                        contract.image_size), torch.float16),
+                        contract.image_size), dtype),
             TensorSpec('position_ids', 'input',
                        (contract.image_views, contract.vision_patches),
                        torch.int64),
             TensorSpec('vit_embeds', 'output',
                        (contract.image_views, contract.vision_patches,
-                        contract.vision_hidden), torch.float16),
+                        contract.vision_hidden), dtype),
         ),
-        'llm_fp16': (
+        f'llm_{precision}': (
             TensorSpec('inputs_embeds', 'input',
                        (contract.batch, contract.sequence_length,
-                        contract.backbone_dim), torch.float16),
+                        contract.backbone_dim), dtype),
             TensorSpec('attention_mask', 'input',
                        (contract.batch, contract.sequence_length),
                        torch.int64),
             TensorSpec('embeddings', 'output',
                        (contract.batch, contract.sequence_length,
-                        contract.backbone_dim), torch.float16),
+                        contract.backbone_dim), dtype),
         ),
     }
 
 
 def _action_head_specs(
     contract: GR00TN15TensorRTContract,
+    precision: str,
 ) -> Mapping[str, tuple[TensorSpec, ...]]:
+    dtype = groot_precision_dtype(precision)
     batch = contract.batch
     sequence = contract.sequence_length
     sa_length = contract.sa_length
@@ -171,49 +198,49 @@ def _action_head_specs(
         'vlln_vl_self_attention': (
             TensorSpec('backbone_features', 'input',
                        (batch, sequence, contract.backbone_dim),
-                       torch.float16),
+                       dtype),
             TensorSpec('output', 'output',
                        (batch, sequence, contract.backbone_dim),
-                       torch.float16),
+                       dtype),
         ),
         'state_encoder': (
             TensorSpec('state', 'input', (batch, 1, contract.state_dim),
-                       torch.float16),
+                       dtype),
             TensorSpec('embodiment_id', 'input', (batch, ), torch.int64),
             TensorSpec('output', 'output',
                        (batch, 1, contract.input_embedding_dim),
-                       torch.float16),
+                       dtype),
         ),
         'action_encoder': (
             TensorSpec('actions', 'input',
                        (batch, contract.action_horizon, contract.action_dim),
-                       torch.float16),
+                       dtype),
             TensorSpec('timesteps_tensor', 'input', (batch, ), torch.int64),
             TensorSpec('embodiment_id', 'input', (batch, ), torch.int64),
             TensorSpec(
                 'output', 'output',
                 (batch, contract.action_horizon, contract.input_embedding_dim),
-                torch.float16),
+                dtype),
         ),
-        'dit_fp16': (
+        f'dit_{precision}': (
             TensorSpec('sa_embs', 'input',
                        (batch, sa_length, contract.input_embedding_dim),
-                       torch.float16),
+                       dtype),
             TensorSpec('vl_embs', 'input',
                        (batch, sequence, contract.backbone_dim),
-                       torch.float16),
+                       dtype),
             TensorSpec('timesteps_tensor', 'input', (batch, ), torch.int64),
             TensorSpec('output', 'output',
                        (batch, sa_length, contract.hidden_size),
-                       torch.float16),
+                       dtype),
         ),
         'action_decoder': (
             TensorSpec('model_output', 'input',
                        (batch, sa_length, contract.hidden_size),
-                       torch.float16),
+                       dtype),
             TensorSpec('embodiment_id', 'input', (batch, ), torch.int64),
             TensorSpec('output', 'output',
-                       (batch, sa_length, contract.action_dim), torch.float16),
+                       (batch, sa_length, contract.action_dim), dtype),
         ),
     }
 
@@ -229,13 +256,14 @@ class _RuntimeGroup:
         profile_index: int,
         strict_manifest: bool,
         runtime_factory: Callable[..., TensorRTRuntime],
+        precision: str,
     ) -> None:
         if strict_manifest is not True:
             raise ValueError('strict_manifest must be true in production')
         self.engine_dir = Path(engine_dir).expanduser()
         self.contract = contract
         self.manifest = _validate_manifest(self.engine_dir, contract,
-                                           engine_names)
+                                           engine_names, precision)
         self.runtimes = {
             name: runtime_factory(
                 self.engine_dir / f'{name}.engine',
@@ -310,19 +338,23 @@ class GR00TN15BackboneTensorRTInference(_RuntimeGroup):
         engine_dir: str | Path,
         *,
         contract: GR00TN15TensorRTContract,
+        precision: str,
         profile_index: int = 0,
         strict_manifest: bool = True,
         runtime_factory: Callable[...,
                                   TensorRTRuntime] = TensorRTRuntime) -> None:
-        names = ('vit_fp16', 'llm_fp16')
-        super().__init__(engine_dir, names, _backbone_specs(contract),
+        self.vision_engine_name = f'vit_{precision}'
+        self.llm_engine_name = f'llm_{precision}'
+        names = (self.vision_engine_name, self.llm_engine_name)
+        specs = _backbone_specs(contract, precision)
+        super().__init__(engine_dir, names, specs,
                          contract, profile_index, strict_manifest,
-                         runtime_factory)
+                         runtime_factory, precision)
 
     def run_vision(self, pixel_values: torch.Tensor,
                    position_ids: torch.Tensor,
                    stream: torch.cuda.Stream) -> torch.Tensor:
-        output = self.runtimes['vit_fp16'].enqueue(
+        output = self.runtimes[self.vision_engine_name].enqueue(
             {
                 'pixel_values': pixel_values,
                 'position_ids': position_ids,
@@ -333,7 +365,7 @@ class GR00TN15BackboneTensorRTInference(_RuntimeGroup):
     def run_llm(self, inputs_embeds: torch.Tensor,
                 attention_mask: torch.Tensor,
                 stream: torch.cuda.Stream) -> torch.Tensor:
-        output = self.runtimes['llm_fp16'].enqueue(
+        output = self.runtimes[self.llm_engine_name].enqueue(
             {
                 'inputs_embeds': inputs_embeds,
                 'attention_mask': attention_mask,
@@ -350,15 +382,18 @@ class GR00TN15ActionHeadTensorRTInference(_RuntimeGroup):
         engine_dir: str | Path,
         *,
         contract: GR00TN15TensorRTContract,
+        precision: str,
         profile_index: int = 0,
         strict_manifest: bool = True,
         runtime_factory: Callable[...,
                                   TensorRTRuntime] = TensorRTRuntime) -> None:
+        self.dit_engine_name = f'dit_{precision}'
         names = ('vlln_vl_self_attention', 'state_encoder', 'action_encoder',
-                 'dit_fp16', 'action_decoder')
-        super().__init__(engine_dir, names, _action_head_specs(contract),
+                 self.dit_engine_name, 'action_decoder')
+        super().__init__(engine_dir, names,
+                         _action_head_specs(contract, precision),
                          contract, profile_index, strict_manifest,
-                         runtime_factory)
+                         runtime_factory, precision)
 
     def process_backbone(self, features: torch.Tensor,
                          stream: torch.cuda.Stream) -> torch.Tensor:
@@ -387,7 +422,7 @@ class GR00TN15ActionHeadTensorRTInference(_RuntimeGroup):
     def run_dit(self, sa_embs: torch.Tensor, vl_embs: torch.Tensor,
                 timestep: torch.Tensor,
                 stream: torch.cuda.Stream) -> torch.Tensor:
-        return self.runtimes['dit_fp16'].enqueue(
+        return self.runtimes[self.dit_engine_name].enqueue(
             {
                 'sa_embs': sa_embs,
                 'vl_embs': vl_embs,
@@ -408,5 +443,6 @@ class GR00TN15ActionHeadTensorRTInference(_RuntimeGroup):
 
 __all__ = [
     'GR00TN15TensorRTContract', 'GR00TN15BackboneTensorRTInference',
-    'GR00TN15ActionHeadTensorRTInference'
+    'GR00TN15ActionHeadTensorRTInference', 'groot_precision_dtype',
+    'groot_dtype_precision'
 ]

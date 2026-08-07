@@ -36,11 +36,11 @@ Run the following commands from the FluxVLA repository root.
 | Model      | Floating-point profile                                         | Static profile                                                                    |
 | ---------- | -------------------------------------------------------------- | --------------------------------------------------------------------------------- |
 | PI0.5      | BF16 main neural compute; FP32 flow state and returned actions | Batch 1, two 224x224 views, 180 language tokens, horizon 10, 10 Euler steps       |
-| GR00T-N1.5 | FP16 main neural compute; FP32 returned actions                | Batch 1, two 224x224 views, sequence length 600, horizon 10, four denoising steps |
+| GR00T-N1.5 | FP16 or BF16 main neural compute; FP32 returned actions        | Batch 1, two 224x224 views, sequence length 600, horizon 10, four denoising steps |
 
-The original GR00T-N1.5 PyTorch configuration uses BF16. The TensorRT profile uses FP16 following the NVIDIA Isaac-GR00T N1.5 deployment reference, and the PyTorch FP16 configuration is retained as the precision-matched speed baseline.
+The original GR00T-N1.5 PyTorch configuration uses BF16. The default TensorRT profile uses FP16 following the NVIDIA Isaac-GR00T N1.5 deployment reference, and an independent BF16 profile is available for precision-matched evaluation.
 
-The reference installation is Linux x86_64, CUDA 12, and TensorRT 11.1. The current pip requirements do not support aarch64 Jetson Orin or Thor; those platforms need their platform TensorRT/JetPack stack and have not been validated here.
+The reference installation is Linux x86_64, CUDA 12, and TensorRT 11.1. The BF16 profile additionally requires a target GPU supported by TensorRT for BF16 execution. The current pip requirements do not support aarch64 Jetson Orin or Thor; those platforms need their platform TensorRT/JetPack stack and have not been validated here.
 
 TensorRT plans are not portable across GPU architectures or TensorRT versions. Rebuild them after changing either. Supporting a different camera count, batch, sequence length, action shape, or solver schedule requires changing the contract, exporting ONNX again, and rebuilding the plans.
 
@@ -58,10 +58,11 @@ python -m scripts.tensorrt.export_onnx pi05 \
 python -m scripts.tensorrt.export_onnx groot-n15 \
   --config configs/gr00t/gr00t_eagle_3b_libero_10_full_finetune.py \
   --checkpoint checkpoints/gr00t_eagle_3b_libero_10_full_finetune_bs64/checkpoints/step-028548-epoch-18-loss=0.0546.safetensors \
-  --sequence-length 600
+  --sequence-length 600 \
+  --precision fp16
 ```
 
-The default outputs are `deployment_artifacts/onnx/pi05` and `deployment_artifacts/onnx/groot_n15`. Each complete export contains an `export_manifest.json`, graph hashes, static shapes, and checkpoint identity.
+Use `--precision bf16` to export the GR00T BF16 profile. The default outputs are `deployment_artifacts/onnx/pi05`, `deployment_artifacts/onnx/groot_n15`, and `deployment_artifacts/onnx/groot_n15_bf16`. Each complete export contains an `export_manifest.json`, graph hashes, static shapes, and checkpoint identity.
 
 ## 3. Build Plans
 
@@ -72,6 +73,11 @@ bash scripts/tensorrt/build_engine.sh \
 bash scripts/tensorrt/build_engine.sh \
   groot-n15 deployment_artifacts/onnx/groot_n15 \
   deployment_artifacts/engines/groot_n15
+
+# GR00T-N1.5 BF16
+bash scripts/tensorrt/build_engine.sh \
+  groot-n15 deployment_artifacts/onnx/groot_n15_bf16 \
+  deployment_artifacts/engines/groot_n15_bf16
 ```
 
 The build writes verbose TensorRT logs, a timing cache, plan hashes, and an `engine_manifest.json`. Runtime loading fails if the plan bundle, checkpoint, TensorRT version, or static contract does not match. Build on the physical GPU that will run the plans.
@@ -96,7 +102,9 @@ torchrun --standalone --nnodes 1 --nproc-per-node 1 scripts/eval.py \
   --ckpt-path checkpoints/gr00t_eagle_3b_libero_10_full_finetune_bs64/checkpoints/step-028548-epoch-18-loss=0.0546.safetensors
 ```
 
-The TensorRT configs expect plans under `deployment_artifacts/engines/pi05` and `deployment_artifacts/engines/groot_n15`. To run eager PyTorch instead, select the corresponding original full-finetune config.
+Select `configs/gr00t/gr00t_eagle_3b_libero_10_tensorrt_bf16.py` to run the independent GR00T TensorRT BF16 profile.
+
+The TensorRT configs expect plans under `deployment_artifacts/engines/pi05`, `deployment_artifacts/engines/groot_n15`, or `deployment_artifacts/engines/groot_n15_bf16`, according to the selected profile. To run eager PyTorch instead, select the corresponding original full-finetune config.
 
 ## 5. Performance
 
