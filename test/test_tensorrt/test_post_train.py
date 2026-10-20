@@ -13,7 +13,6 @@
 # limitations under the License.
 """CPU-only tests for automatic post-training TensorRT conversion."""
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +24,7 @@ import pytest
 from scripts.tensorrt.post_train import (build_engine_command,
                                          build_onnx_export_command,
                                          convert_checkpoint_to_tensorrt,
+                                         get_non_distributed_environment,
                                          resolve_tensorrt_profile,
                                          validate_tensorrt_environment)
 
@@ -159,10 +159,16 @@ def test_conversion_runs_export_before_engine_build(run):
                                                output_root)
     build_command, expected_directory = build_engine_command(
         PROJECT_ROOT, 'pi05', output_root)
-    build_environment = os.environ.copy()
+    export_environment = get_non_distributed_environment()
+    build_environment = export_environment.copy()
     build_environment['TRTEXEC'] = '/opt/tensorrt/bin/trtexec'
     assert run.call_args_list == [
-        call(export_command, cwd=PROJECT_ROOT, check=True),
+        call(
+            export_command,
+            cwd=PROJECT_ROOT,
+            env=export_environment,
+            check=True,
+        ),
         call(
             build_command,
             cwd=PROJECT_ROOT,

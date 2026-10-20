@@ -870,6 +870,8 @@ class BaseTrainRunner(ABC):
                     epoch_step_count = 0
                     dataloader_iter = None
 
+        if not self._should_save_step_checkpoint():
+            self._save_and_sync()
         return self._get_checkpoint_path()
 
     def _sync_step_based_epoch_with_global_step(self) -> None:
@@ -959,6 +961,8 @@ class BaseTrainRunner(ABC):
                 if self._should_save_epoch_checkpoint():
                     self._save_and_sync()
 
+        if not self._should_save_epoch_checkpoint():
+            self._save_and_sync()
         return self._get_checkpoint_path()
 
     def _get_steps_per_epoch(self, vla_dataset) -> Optional[int]:

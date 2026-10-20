@@ -41,30 +41,10 @@ from fluxvla.engines import (  # noqa: E402
     build_dataset_from_cfg, build_runner_from_cfg, initialize_overwatch)
 from fluxvla.engines.utils.torch_utils import set_global_seed  # noqa: E402
 from scripts.tensorrt.post_train import (  # noqa: E402
-    convert_checkpoint_to_tensorrt, resolve_tensorrt_profile,
-    validate_tensorrt_environment)
+    convert_checkpoint_to_tensorrt, get_non_distributed_environment,
+    resolve_tensorrt_profile, validate_tensorrt_environment)
 
 overwatch = initialize_overwatch(__name__)
-
-_DISTRIBUTED_ENV_KEYS = (
-    'GROUP_RANK',
-    'GROUP_WORLD_SIZE',
-    'LOCAL_RANK',
-    'LOCAL_WORLD_SIZE',
-    'MASTER_ADDR',
-    'MASTER_PORT',
-    'NODE_RANK',
-    'RANK',
-    'ROLE_NAME',
-    'ROLE_RANK',
-    'ROLE_WORLD_SIZE',
-    'TORCHELASTIC_ERROR_FILE',
-    'TORCHELASTIC_MAX_RESTARTS',
-    'TORCHELASTIC_RESTART_COUNT',
-    'TORCHELASTIC_RUN_ID',
-    'WORLD_SIZE',
-)
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -166,13 +146,6 @@ def _resolve_eval_config_path(args):
     return os.path.abspath(args.config)
 
 
-def _get_clean_eval_relaunch_env():
-    env = os.environ.copy()
-    for key in _DISTRIBUTED_ENV_KEYS:
-        env.pop(key, None)
-    return env
-
-
 def _get_int_env(name, default):
     try:
         return int(os.environ.get(name, default))
@@ -260,7 +233,8 @@ def _relaunch_eval_in_fresh_process(args, eval_ckpt_path, relaunch_spec):
         overwatch.info(
             'Re-launching evaluation in a fresh distributed job with '
             f"{relaunch_spec['local_world_size']} worker(s) per node.")
-        os.execvpe(sys.executable, eval_argv, _get_clean_eval_relaunch_env())
+        os.execvpe(sys.executable, eval_argv,
+                   get_non_distributed_environment())
 
     eval_argv = [
         sys.executable, '-m', 'torch.distributed.run', '--standalone',
@@ -269,7 +243,8 @@ def _relaunch_eval_in_fresh_process(args, eval_ckpt_path, relaunch_spec):
     overwatch.info(
         'Re-launching evaluation in a fresh single-worker process to '
         'fully release training CUDA/FSDP state before eval.')
-    os.execvpe(sys.executable, eval_argv, _get_clean_eval_relaunch_env())
+    os.execvpe(sys.executable, eval_argv,
+               get_non_distributed_environment())
 
 
 def _close_dataset(dataset):

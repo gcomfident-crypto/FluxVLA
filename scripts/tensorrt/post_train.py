@@ -23,6 +23,34 @@ import sys
 from pathlib import Path
 
 
+_DISTRIBUTED_ENV_KEYS = (
+    'GROUP_RANK',
+    'GROUP_WORLD_SIZE',
+    'LOCAL_RANK',
+    'LOCAL_WORLD_SIZE',
+    'MASTER_ADDR',
+    'MASTER_PORT',
+    'NODE_RANK',
+    'RANK',
+    'ROLE_NAME',
+    'ROLE_RANK',
+    'ROLE_WORLD_SIZE',
+    'TORCHELASTIC_ERROR_FILE',
+    'TORCHELASTIC_MAX_RESTARTS',
+    'TORCHELASTIC_RESTART_COUNT',
+    'TORCHELASTIC_RUN_ID',
+    'WORLD_SIZE',
+)
+
+
+def get_non_distributed_environment() -> dict[str, str]:
+    """Return the current environment without torchrun worker state."""
+    environment = os.environ.copy()
+    for key in _DISTRIBUTED_ENV_KEYS:
+        environment.pop(key, None)
+    return environment
+
+
 def resolve_tensorrt_profile(model_cfg) -> str:
     """Resolve a supported static TensorRT profile from the training model."""
     if model_cfg.type == 'PI05FlowMatching':
@@ -142,8 +170,14 @@ def convert_checkpoint_to_tensorrt(project_root: Path, model: str,
     build_command, engine_directory = build_engine_command(
         project_root, model, output_root)
 
-    subprocess.run(export_command, cwd=project_root, check=True)
-    build_environment = os.environ.copy()
+    export_environment = get_non_distributed_environment()
+    subprocess.run(
+        export_command,
+        cwd=project_root,
+        env=export_environment,
+        check=True,
+    )
+    build_environment = export_environment.copy()
     build_environment['TRTEXEC'] = trtexec
     subprocess.run(
         build_command,
