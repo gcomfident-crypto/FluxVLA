@@ -1012,7 +1012,7 @@ If you use VLM-based SARM annotation, place the official SARM VLM under `./check
 - Supports remote inference infrastructure with ZMQ-based server/client architecture, enabling GPU-offloaded inference for resource-constrained edge devices. See [Remote Inference Serving](docs/remote_inference_serving.md).
 - Supports [RTC (Real-Time Chunking)](docs/rtc.md) to improve cross-chunk trajectory continuity.
 - Supports accelerated inference for GR00T and PI0.5; see [Inference Acceleration](docs/inference_acceleration.md), including Triton fused kernels, CUDA Graph capture, and CUDA custom operators.
-- Supports TensorRT engine export and runtime deployment for GR00T-N1.5 and PI0.5; see [TensorRT Deployment](scripts/tensorrt/README.md).
+- Supports automatic post-training TensorRT engine builds and runtime deployment for GR00T-N1.5 and PI0.5; see [TensorRT Deployment](scripts/tensorrt/README.md).
 - Provides a minimal Oli humanoid whole-body (loco-manipulation) real-robot inference path (rospy sensor input + WebSocket control; base/hand commands are robot-SDK integration points). See [docs/oli_whole_body.md](docs/oli_whole_body.md).
 
 </details>
@@ -1036,6 +1036,22 @@ Example:
 export WANDB_MODE=disabled
 /root/miniconda3/envs/fluxvla/bin/torchrun --standalone --nnodes 1 --nproc-per-node 2 scripts/train.py --config configs/pi05/pi05_paligemma_libero_10_full_finetune.py --work-dir ./checkpoints/pi05_paligemma_libero_10_full_finetune --cfg-options train_dataloader.per_device_batch_size=2
 ```
+
+To export the final supported checkpoint to ONNX and build TensorRT engines
+automatically, install `requirements-tensorrt.txt`, make `trtexec` available,
+and add the post-training flag:
+
+```bash
+TRTEXEC=/absolute/path/to/trtexec \
+torchrun --standalone --nnodes 1 --nproc-per-node 2 scripts/train.py \
+  --config configs/pi05/pi05_paligemma_libero_10_full_finetune.py \
+  --work-dir work_dirs/pi05_libero_10 \
+  --export-tensorrt-after-train
+```
+
+Artifacts are written under `<work-dir>/tensorrt` by default. Use
+`--tensorrt-output-dir` to choose another root. See the deployment guide for
+the supported static PI0.5 and GR00T-N1.5 profiles.
 
 RoboCasa GR00T smoke training example:
 

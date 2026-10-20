@@ -277,6 +277,7 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
                         generator=generator).to(torch.float16)
             else:
                 actions = noise.to(torch.float16).contiguous()
+            self._zero_padded_dims_(actions)
 
             timestep = torch.empty((c.batch, ),
                                    dtype=torch.int64,
@@ -309,6 +310,7 @@ class FlowMatchingTensorRTHead(FlowMatchingHead):
                             model_output, embodiment, selected_stream)
                     velocity = prediction[:, -c.action_horizon:]
                     actions = actions + dt * velocity
+                    self._zero_padded_dims_(actions)
 
             result = actions.clone()
             if self.ori_action_dim is not None:

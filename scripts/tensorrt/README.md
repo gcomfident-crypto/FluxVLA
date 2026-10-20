@@ -26,7 +26,7 @@ Install `trtexec` separately from the TensorRT SDK and ensure that it matches th
 
 ```bash
 python -c "import tensorrt; print(tensorrt.__version__)"
-trtexec --version
+python scripts/tensorrt/trtexec_version.py "$(command -v trtexec)"
 ```
 
 Run the following commands from the FluxVLA repository root.
@@ -46,7 +46,32 @@ TensorRT plans are not portable across GPU architectures or TensorRT versions. R
 
 Both profiles require exactly two present, valid camera views. The documented LIBERO transform emits `img_masks=[[True, True]]`; image validity is baked into the exported graphs rather than exposed as a TensorRT binding. Missing or variably valid views are unsupported.
 
-## 2. Export ONNX
+## 2. Build Automatically After Training
+
+Add `--export-tensorrt-after-train` to a supported PI0.5 or GR00T-N1.5 training command:
+
+```bash
+TRTEXEC=/absolute/path/to/trtexec \
+torchrun --standalone --nnodes 1 --nproc-per-node 2 scripts/train.py \
+  --config configs/gr00tn15/gr00tn15_eagle_3b_libero_10_full_finetune.py \
+  --work-dir work_dirs/gr00tn15_libero_10 \
+  --export-tensorrt-after-train
+```
+
+ONNX and `trtexec` are checked before dataset or model construction, so a missing deployment toolchain fails before training starts. After training, FluxVLA releases the runner and CUDA state, selects the final checkpoint (preferring its `.safetensors` sidecar), exports ONNX on global rank 0, and builds the plans synchronously. Export or build failures are returned as training-job failures.
+
+The default outputs are:
+
+```text
+<work-dir>/tensorrt/onnx/pi05
+<work-dir>/tensorrt/engines/pi05
+<work-dir>/tensorrt/onnx/groot_n15
+<work-dir>/tensorrt/engines/groot_n15
+```
+
+Set `--tensorrt-output-dir /path/to/artifacts` to replace the `<work-dir>/tensorrt` root. PI0.5 uses the fixed BF16 profile; GR00T-N1.5 uses the fixed FP16 profile. The option rejects other model families and incompatible static action/state/denoising contracts before training.
+
+## 3. Export ONNX Manually
 
 ```bash
 # PI0.5
@@ -56,14 +81,14 @@ python -m scripts.tensorrt.export_onnx pi05 \
 
 # GR00T-N1.5
 python -m scripts.tensorrt.export_onnx groot-n15 \
-  --config configs/gr00t/gr00t_eagle_3b_libero_10_full_finetune.py \
+  --config configs/gr00tn15/gr00tn15_eagle_3b_libero_10_full_finetune.py \
   --checkpoint checkpoints/gr00t_eagle_3b_libero_10_full_finetune_bs64/checkpoints/step-028548-epoch-18-loss=0.0546.safetensors \
   --sequence-length 600
 ```
 
 The default outputs are `deployment_artifacts/onnx/pi05` and `deployment_artifacts/onnx/groot_n15`. Each complete export contains an `export_manifest.json`, graph hashes, static shapes, and checkpoint identity.
 
-## 3. Build Plans
+## 4. Build Plans Manually
 
 ```bash
 bash scripts/tensorrt/build_engine.sh \
@@ -76,7 +101,7 @@ bash scripts/tensorrt/build_engine.sh \
 
 The build writes verbose TensorRT logs, a timing cache, plan hashes, and an `engine_manifest.json`. Runtime loading fails if the plan bundle, checkpoint, TensorRT version, or static contract does not match. Build on the physical GPU that will run the plans.
 
-## 4. Run Evaluation
+## 5. Run Evaluation
 
 PI0.5 TensorRT:
 
@@ -92,13 +117,13 @@ GR00T-N1.5 TensorRT:
 ```bash
 MUJOCO_GL=egl WANDB_MODE=disabled TOKENIZERS_PARALLELISM=false \
 torchrun --standalone --nnodes 1 --nproc-per-node 1 scripts/eval.py \
-  --config configs/gr00t/gr00t_eagle_3b_libero_10_tensorrt.py \
+  --config configs/gr00tn15/gr00tn15_eagle_3b_libero_10_tensorrt.py \
   --ckpt-path checkpoints/gr00t_eagle_3b_libero_10_full_finetune_bs64/checkpoints/step-028548-epoch-18-loss=0.0546.safetensors
 ```
 
 The TensorRT configs expect plans under `deployment_artifacts/engines/pi05` and `deployment_artifacts/engines/groot_n15`. To run eager PyTorch instead, select the corresponding original full-finetune config.
 
-## 5. Performance
+## 6. Performance
 
 The following results were measured on one NVIDIA GeForce RTX 5090 with batch size 1, all 10 LIBERO-10 tasks, 50 trials per task, and five warm-up calls. Simulator stepping is excluded from policy and pipeline latency.
 

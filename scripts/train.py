@@ -19,6 +19,7 @@ import os
 import random
 import socket
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import draccus
@@ -28,13 +29,20 @@ import torch.distributed as dist
 import yaml
 from mmengine import Config, DictAction
 
-from fluxvla.datasets.utils import (save_dataset_statistics,
-                                    save_grouped_dataset_statistics)
-from fluxvla.datasets.utils.transformed_statistics import \
-    compute_statistics_from_dataset_config
-from fluxvla.engines import (build_dataset_from_cfg, build_runner_from_cfg,
-                             initialize_overwatch)
-from fluxvla.engines.utils.torch_utils import set_global_seed
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from fluxvla.datasets.utils import (  # noqa: E402
+    save_dataset_statistics, save_grouped_dataset_statistics)
+from fluxvla.datasets.utils.transformed_statistics import (  # noqa: E402
+    compute_statistics_from_dataset_config)
+from fluxvla.engines import (  # noqa: E402
+    build_dataset_from_cfg, build_runner_from_cfg, initialize_overwatch)
+from fluxvla.engines.utils.torch_utils import set_global_seed  # noqa: E402
+from scripts.tensorrt.post_train import (  # noqa: E402
+    convert_checkpoint_to_tensorrt, resolve_tensorrt_profile,
+    validate_tensorrt_environment)
 
 overwatch = initialize_overwatch(__name__)
 
@@ -92,7 +100,23 @@ def parse_args():
         default=None,
         help='Path to the checkpoint file to resume training from.',
     )
+    parser.add_argument(
+        '--export-tensorrt-after-train',
+        action='store_true',
+        help=('Export the final supported checkpoint to ONNX and build '
+              'TensorRT engines after training.'),
+    )
+    parser.add_argument(
+        '--tensorrt-output-dir',
+        type=str,
+        help=('TensorRT artifact root. Defaults to '
+              '<work-dir>/tensorrt.'),
+    )
     args, unknown = parser.parse_known_args()
+    if (args.tensorrt_output_dir is not None
+            and not args.export_tensorrt_after_train):
+        parser.error('--tensorrt-output-dir requires '
+                     '--export-tensorrt-after-train')
     return args, unknown
 
 
@@ -259,8 +283,8 @@ def _close_dataset(dataset):
 
 
 def _release_training_resources(runner, dataset, eval_dataset=None):
-    """Release training state before building evaluation objects."""
-    overwatch.info('Cleaning up training resources before evaluation.')
+    """Release training state before running post-training tasks."""
+    overwatch.info('Cleaning up training resources after training.')
     _sync_distributed()
 
     if runner is not None and hasattr(runner, 'cleanup'):
@@ -309,17 +333,14 @@ def _build_optional_training_eval_dataset(cfg):
     return build_dataset_from_cfg(dataset_cfg)
 
 
-def _resolve_eval_ckpt_path(ckpt_path):
-    """Prefer the .safetensors sibling of a .pt checkpoint for evaluation.
+def _resolve_inference_ckpt_path(ckpt_path):
+    """Prefer the .safetensors sibling for post-training inference tasks.
 
     The .pt file produced during training contains the full optimizer state
     (AdamW fp32 momentum + variance) and scheduler state, which are not
-    needed for inference. When eval-after-train spawns the eval runner on
-    every rank, each rank would otherwise ``torch.load`` the entire .pt on
-    CPU. On multi-GPU single-node setups this can easily exhaust system RAM
-    and trigger the OOM killer (SIGKILL / exit code -9). The matching
-    ``.safetensors`` file only stores model weights and is dramatically
-    cheaper to load.
+    needed for inference or export. Loading the .pt file on every evaluation
+    rank can exhaust system RAM, while the matching .safetensors file only
+    stores model weights.
     """
     if ckpt_path is None:
         return ckpt_path
@@ -329,11 +350,23 @@ def _resolve_eval_ckpt_path(ckpt_path):
         sf_candidate = ckpt_path[:-len('.pt')] + '.safetensors'
         if os.path.exists(sf_candidate):
             overwatch.info(
-                f'Using safetensors checkpoint for evaluation: {sf_candidate} '
-                f'(replaces {ckpt_path} to avoid loading optimizer state on '
-                f'every rank).')
+                'Using safetensors checkpoint for post-training task: '
+                f'{sf_candidate} (replaces {ckpt_path}).')
             return sf_candidate
     return ckpt_path
+
+
+def _create_tensorrt_sync_group():
+    """Create a CPU group whose timeout covers long TensorRT plan builds."""
+    if not (dist.is_available() and dist.is_initialized()):
+        return None
+    return dist.new_group(backend='gloo', timeout=timedelta(hours=24))
+
+
+def _finish_tensorrt_sync_group(group):
+    if group is not None:
+        dist.barrier(group=group)
+        dist.destroy_process_group(group)
 
 
 def _get_nested_value(obj, path):
@@ -429,6 +462,16 @@ def train(args, cfg):
     Args:
         cfg (Config): The configuration object containing training settings.
     """
+    tensorrt_model = None
+    trtexec = None
+    if args.export_tensorrt_after_train:
+        tensorrt_model = resolve_tensorrt_profile(cfg.model)
+        if overwatch.is_rank_zero():
+            trtexec = validate_tensorrt_environment(PROJECT_ROOT)
+            overwatch.info('TensorRT export after training is enabled for '
+                           f'{tensorrt_model}.')
+        _sync_distributed()
+
     seed = _resolve_train_seed(cfg)
     if seed is not None:
         set_global_seed(seed)
@@ -468,23 +511,50 @@ def train(args, cfg):
             overwatch.info('Training RNG reset after model setup; '
                            f'rank-local base seed is {rank_seed}.')
     ckpt_path = runner.run(dataset, eval_dataset=eval_dataset)
-    if args.eval_after_train:
-        if not hasattr(cfg, 'eval'):
-            overwatch.warning(
-                'No evaluation configuration found. Skipping evaluation.')
-            return
+    run_eval = args.eval_after_train and hasattr(cfg, 'eval')
+    if args.eval_after_train and not run_eval:
+        overwatch.warning(
+            'No evaluation configuration found. Skipping evaluation.')
+
+    if args.export_tensorrt_after_train or run_eval:
         runner, dataset, eval_dataset = _release_training_resources(
             runner, dataset, eval_dataset)
+
+    inference_ckpt_path = None
+    if args.export_tensorrt_after_train or run_eval:
+        inference_ckpt_path = _resolve_inference_ckpt_path(ckpt_path)
+
+    if args.export_tensorrt_after_train:
+        if inference_ckpt_path is None:
+            raise RuntimeError(
+                'TensorRT export checkpoint path is missing after training.')
+        tensorrt_sync_group = _create_tensorrt_sync_group()
+        if overwatch.is_rank_zero():
+            output_root = (
+                Path(args.tensorrt_output_dir) if args.tensorrt_output_dir
+                is not None else Path(args.work_dir) / 'tensorrt')
+            engine_directory = convert_checkpoint_to_tensorrt(
+                project_root=PROJECT_ROOT,
+                model=tensorrt_model,
+                config_path=Path(_resolve_eval_config_path(args)),
+                checkpoint_path=Path(inference_ckpt_path),
+                output_root=output_root,
+                trtexec=trtexec,
+            )
+            overwatch.info(f'TensorRT engines written to {engine_directory}.')
+        _finish_tensorrt_sync_group(tensorrt_sync_group)
+
+    if run_eval:
         overwatch.info('Evaluation after training is enabled.')
-        eval_ckpt_path = _resolve_eval_ckpt_path(ckpt_path)
         relaunch_spec = _get_eval_relaunch_spec()
         _destroy_distributed_process_group()
         _clear_cuda_memory()
         if not _should_launch_eval(relaunch_spec):
             return
-        assert eval_ckpt_path is not None, (
+        assert inference_ckpt_path is not None, (
             'Evaluation checkpoint path is missing after training.')
-        _relaunch_eval_in_fresh_process(args, eval_ckpt_path, relaunch_spec)
+        _relaunch_eval_in_fresh_process(args, inference_ckpt_path,
+                                        relaunch_spec)
 
 
 if __name__ == '__main__':

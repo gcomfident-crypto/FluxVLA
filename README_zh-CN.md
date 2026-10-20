@@ -927,6 +927,7 @@ huggingface-cli download openai/clip-vit-base-patch32 --local-dir ./checkpoints/
 - 支持基于 ZMQ 通信框架的远程推理设施，利用 server/client 架构将模型推理负载装卸到服务器端，适用于算力受限的边缘设备部署。详见 [远程推理服务](docs/remote_inference_serving.md)。
 - 支持 [RTC (Real-Time Chunking)](docs/rtc.md)，提升跨 chunk 轨迹连续性。
 - 支持 GR00T 与 PI0.5 推理加速；详见 [Inference Acceleration](docs/inference_acceleration.md)，包含 Triton 融合核、CUDA Graph 捕获与 CUDA 自定义算子。
+- 支持 GR00T-N1.5 与 PI0.5 在训练完成后自动构建 TensorRT engine，并支持 TensorRT 运行时部署；详见 [TensorRT 部署](scripts/tensorrt/README.md)。
 - 提供 Oli 人形机器人全身（移动操作）真机推理最小链路（rospy 传感器输入 + WebSocket 控制；底盘 / 手部命令为机器人 SDK 集成点）。详见 [docs/oli_whole_body.md](docs/oli_whole_body.md)。
 
 </details>
@@ -950,6 +951,18 @@ huggingface-cli download openai/clip-vit-base-patch32 --local-dir ./checkpoints/
 export WANDB_MODE=disabled
 /root/miniconda3/envs/fluxvla/bin/torchrun --standalone --nnodes 1 --nproc-per-node 2 scripts/train.py --config configs/pi05/pi05_paligemma_libero_10_full_finetune.py --work-dir ./checkpoints/pi05_paligemma_libero_10_full_finetune --cfg-options train_dataloader.per_device_batch_size=2
 ```
+
+若要在支持的模型训练完成后自动导出 ONNX 并构建 TensorRT engine，请先安装 `requirements-tensorrt.txt`、准备好 `trtexec`，然后增加训练后转换开关：
+
+```bash
+TRTEXEC=/absolute/path/to/trtexec \
+torchrun --standalone --nnodes 1 --nproc-per-node 2 scripts/train.py \
+  --config configs/pi05/pi05_paligemma_libero_10_full_finetune.py \
+  --work-dir work_dirs/pi05_libero_10 \
+  --export-tensorrt-after-train
+```
+
+默认产物位于 `<work-dir>/tensorrt`；可通过 `--tensorrt-output-dir` 指定其他根目录。当前自动转换支持固定部署契约的 PI0.5（BF16）和 GR00T-N1.5（FP16），完整说明见 TensorRT 部署文档。
 
 RoboCasa GR00T 冒烟训练示例：
 

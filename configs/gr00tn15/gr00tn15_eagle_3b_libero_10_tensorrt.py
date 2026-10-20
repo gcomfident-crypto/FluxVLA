@@ -45,6 +45,7 @@ inference_model = dict(
         input_embedding_dim=1536,
         num_steps=10,
         num_inference_timesteps=4,
+        zero_padded_action_dims=True,
         action_dim=32,
         ori_action_dim=7,
         strict_manifest=True,

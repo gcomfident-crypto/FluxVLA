@@ -28,11 +28,21 @@ MODEL=${1:?model is required: pi05 or groot-n15}
 ONNX_DIR=${2:?ONNX directory is required}
 ENGINE_DIR=${3:?engine output directory is required}
 TRTEXEC=${TRTEXEC:-trtexec}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 if ! command -v "${TRTEXEC}" >/dev/null 2>&1; then
     echo "trtexec was not found. Set TRTEXEC=/absolute/path/to/trtexec."
     exit 1
 fi
+
+if [[ "${MODEL}" != "pi05" && "${MODEL}" != "groot-n15" ]]; then
+    echo "Unsupported model: ${MODEL}; expected pi05 or groot-n15"
+    exit 1
+fi
+
+TRTEXEC_IDENTITY=$(
+    python3 "${SCRIPT_DIR}/trtexec_version.py" "${TRTEXEC}"
+)
 
 MANIFEST="${ONNX_DIR}/export_manifest.json"
 if [[ ! -f "${MANIFEST}" ]]; then
@@ -165,18 +175,17 @@ else
     exit 1
 fi
 
-python3 - "${MANIFEST}" "${ENGINE_DIR}" "${MODEL}" "${TRTEXEC}" <<'PY'
+python3 - "${MANIFEST}" "${ENGINE_DIR}" "${MODEL}" \
+    "${TRTEXEC_IDENTITY}" <<'PY'
 import hashlib
 import json
 import pathlib
-import re
-import subprocess
 import sys
 
 source = pathlib.Path(sys.argv[1])
 engine_dir = pathlib.Path(sys.argv[2])
 model = sys.argv[3]
-trtexec = sys.argv[4]
+trtexec_identity = json.loads(sys.argv[4])
 manifest = json.loads(source.read_text(encoding='utf-8'))
 expected = {
     'pi05': ('vision', 'prefix', 'denoise'),
@@ -195,16 +204,8 @@ for name in expected:
             digest.update(block)
     engines[path.stem] = {'file': path.name, 'sha256': digest.hexdigest(),
                           'bytes': path.stat().st_size}
-version_process = subprocess.run(
-    [trtexec, '--version'], capture_output=True, text=True, check=False)
-version_text = version_process.stdout + version_process.stderr
-encoded = re.search(r'TensorRT v(\d+)', version_text)
-if encoded is None:
-    raise RuntimeError('Could not determine the trtexec TensorRT version')
-number = int(encoded.group(1))
-tensorrt_version = f'{number // 10000}.{number // 100 % 100}.{number % 100}'
-manifest.update({'engine_model': model, 'trtexec': encoded.group(0),
-                 'tensorrt_version': tensorrt_version,
+manifest.update({'engine_model': model, 'trtexec': trtexec_identity['label'],
+                 'tensorrt_version': trtexec_identity['version'],
                  'engines': engines, 'cuda_graph': False})
 (engine_dir / 'engine_manifest.json').write_text(
     json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8')
